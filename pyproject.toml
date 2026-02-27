@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yolo-contrastive"
+version = "0.2.0"
+description = "Contrastive learning extensions for Ultralytics YOLOv8+"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Taha Yasin Er"},
+]
+
+# audit §5.1 — torch is a hard runtime dependency
+dependencies = [
+    "torch>=2.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+yolo = ["ultralytics>=8.0.0"]
+dev  = ["pytest", "ruff", "pre-commit"]
+all  = ["yolo-contrastive[yolo,dev]"]
+
+[project.urls]
+Homepage   = "https://github.com/TahaErr/yolo-contrastive"
+Repository = "https://github.com/TahaErr/yolo-contrastive"
+Issues     = "https://github.com/TahaErr/yolo-contrastive/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
