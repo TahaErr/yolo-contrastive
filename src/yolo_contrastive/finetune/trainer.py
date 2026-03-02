@@ -61,7 +61,7 @@ class FinetuneDetectionTrainer(DetectionTrainer):
         if not getattr(self, "_ycl_has_pretrained", False):
             return super().build_optimizer(model, name, lr, momentum, decay, **kwargs)
 
-        # Önce Ultralytics'in auto optimizer'ını oluştur — doğru LR'yi hesaplasın
+        # Önce Ultralytics'in optimizer'ını oluştur — doğru LR'yi hesaplasın
         base_opt = super().build_optimizer(model, name, lr, momentum, decay, **kwargs)
 
         # Auto hesaplanan LR'yi al
@@ -71,8 +71,7 @@ class FinetuneDetectionTrainer(DetectionTrainer):
 
         # Parametreleri ayır
         backbone_params = []
-        head_params_weight = []
-        head_params_bias = []
+        head_params = []
 
         for pname, param in model.named_parameters():
             if not param.requires_grad:
@@ -87,27 +86,38 @@ class FinetuneDetectionTrainer(DetectionTrainer):
                     pass
             if is_backbone:
                 backbone_params.append(param)
-            elif "bias" in pname or "bn" in pname:
-                head_params_bias.append(param)
             else:
-                head_params_weight.append(param)
+                head_params.append(param)
 
         if not backbone_params:
-            _log("[ycl-ft] No trainable backbone params — using auto optimizer")
+            _log("[ycl-ft] No trainable backbone params — using base optimizer")
             return base_opt
 
         _log(f"[ycl-ft] Differential LR (from auto_lr={auto_lr:.6f}): "
              f"backbone({len(backbone_params)})={bb_lr:.6f}, "
-             f"head({len(head_params_weight) + len(head_params_bias)})={auto_lr:.6f}")
+             f"head({len(head_params)})={auto_lr:.6f}")
 
-        optimizer = torch.optim.AdamW([
-            {"params": backbone_params, "lr": bb_lr,
-             "initial_lr": bb_lr, "weight_decay": decay},
-            {"params": head_params_weight, "lr": auto_lr,
-             "initial_lr": auto_lr, "weight_decay": decay},
-            {"params": head_params_bias, "lr": auto_lr,
-             "initial_lr": auto_lr, "weight_decay": 0.0},
-        ])
+        # FIX: Kullanıcının seçtiği optimizer türüne saygı duy
+        # base_opt'ın türünü kullanarak aynı tip optimizer oluştur
+        opt_cls = type(base_opt)
+
+        # base_opt'tan defaults'ı al (momentum, betas vb.)
+        defaults = {k: v for k, v in base_opt.defaults.items()
+                    if k not in ("lr", "initial_lr")}
+
+        try:
+            optimizer = opt_cls([
+                {"params": backbone_params, "lr": bb_lr,
+                 "initial_lr": bb_lr, **defaults},
+                {"params": head_params, "lr": auto_lr,
+                 "initial_lr": auto_lr, **defaults},
+            ])
+        except Exception as e:
+            _log(f"[ycl-ft] WARN: Could not create {opt_cls.__name__} with "
+                 f"differential LR: {e}. Falling back to base optimizer.")
+            return base_opt
+
+        _log(f"[ycl-ft] Optimizer: {opt_cls.__name__} with differential LR")
         return optimizer
 
     def preprocess_batch(self, batch):

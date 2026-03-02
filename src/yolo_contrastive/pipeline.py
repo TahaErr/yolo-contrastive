@@ -1,21 +1,10 @@
-"""Unified pipeline — dataset yapısına göre otomatik eğitim.
-
-Kullanım:
-    from yolo_contrastive.pipeline import auto_train
-
-    # Otomatik mod algılama
-    results = auto_train(data_yaml="path/to/data.yaml")
-
-    # Veya manuel pipeline
-    from yolo_contrastive.pipeline import SSLFinetunePipeline
-    pipeline = SSLFinetunePipeline(config=PipelineConfig(...))
-    results = pipeline.run(data_yaml="...", images_dir="...")
-"""
+"""Unified pipeline — dataset yapısına göre otomatik eğitim."""
 
 from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
@@ -33,9 +22,26 @@ def _log(msg: str):
         print(msg)
 
 
+@contextmanager
+def _env_vars(**kwargs):
+    """Temporary env vars — restored when block exits."""
+    old = {}
+    for key, val in kwargs.items():
+        old[key] = os.environ.get(key)
+        os.environ[key] = str(val)
+    try:
+        yield
+    finally:
+        for key in kwargs:
+            if old[key] is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old[key]
+
+
 @dataclass
 class PipelineConfig:
-    """Tüm pipeline konfigürasyonu."""
+    """Full pipeline configuration."""
 
     # Model
     model: str = "yolov8n.pt"
@@ -88,10 +94,6 @@ class SSLFinetunePipeline:
         SSL_FINETUNE: unlabeled + labeled → pretrain → finetune
         DETECTION:    labeled only → detection training
         SSL_ONLY:     unlabeled only → backbone pretrain
-
-    Kullanım:
-        pipeline = SSLFinetunePipeline(config=PipelineConfig(ssl_epochs=10))
-        results = pipeline.run(data_yaml="data.yaml")
     """
 
     def __init__(self, config: Optional[PipelineConfig] = None, **kwargs):
@@ -112,7 +114,7 @@ class SSLFinetunePipeline:
         unlabeled_dir: Optional[str] = None,
         dataset_dir: Optional[str] = None,
     ) -> DatasetInfo:
-        """Dataset yapısını algıla."""
+        """Discover dataset structure."""
         self.dataset_info = discover(
             data_yaml=data_yaml,
             unlabeled_dir=unlabeled_dir,
@@ -130,7 +132,7 @@ class SSLFinetunePipeline:
         """Aşama: SSL Pretraining."""
         images_dir = images_dir or (self.dataset_info.unlabeled_dir if self.dataset_info else None)
         if not images_dir:
-            raise ConfigError("Etiketsiz görüntü klasörü bulunamadı")
+            raise ConfigError("Unlabeled image directory not found")
 
         output = output or self.cfg.backbone_path
 
@@ -175,7 +177,7 @@ class SSLFinetunePipeline:
         """Aşama: Fine-tune with pretrained backbone."""
         data_yaml = data_yaml or (self.dataset_info.data_yaml if self.dataset_info else None)
         if not data_yaml:
-            raise ConfigError("data.yaml bulunamadı")
+            raise ConfigError("data.yaml not found")
 
         backbone_path = backbone_path or self.backbone_path
         if not backbone_path or not os.path.exists(backbone_path):
@@ -188,11 +190,6 @@ class SSLFinetunePipeline:
         _log("🎯 Fine-tuning (pretrained backbone)")
         _log("=" * 60)
 
-        os.environ["YCL_PRETRAINED"] = str(backbone_path)
-        os.environ["YCL_FREEZE_BACKBONE"] = str(self.cfg.ft_freeze_layers)
-        os.environ["YCL_UNFREEZE_EPOCH"] = str(self.cfg.ft_unfreeze_epoch)
-        os.environ["YCL_BACKBONE_LR_SCALE"] = str(self.cfg.ft_backbone_lr_scale)
-
         from ultralytics import YOLO
         from .finetune import FinetuneDetectionTrainer
 
@@ -201,19 +198,27 @@ class SSLFinetunePipeline:
             device = 0 if torch.cuda.is_available() else "cpu"
 
         model = YOLO(self.cfg.model)
-        t0 = time.time()
-        self.results = model.train(
-            data=data_yaml,
-            epochs=self.cfg.ft_epochs,
-            imgsz=self.cfg.imgsz,
-            batch=self.cfg.ft_batch,
-            device=device,
-            trainer=FinetuneDetectionTrainer,
-            project=self.cfg.project,
-            name=self.cfg.name + "_finetune",
-            exist_ok=True,
-        )
-        self.ft_time = time.time() - t0
+
+        # FIX: env var'lar context manager ile geçici set edilir
+        with _env_vars(
+            YCL_PRETRAINED=backbone_path,
+            YCL_FREEZE_BACKBONE=self.cfg.ft_freeze_layers,
+            YCL_UNFREEZE_EPOCH=self.cfg.ft_unfreeze_epoch,
+            YCL_BACKBONE_LR_SCALE=self.cfg.ft_backbone_lr_scale,
+        ):
+            t0 = time.time()
+            self.results = model.train(
+                data=data_yaml,
+                epochs=self.cfg.ft_epochs,
+                imgsz=self.cfg.imgsz,
+                batch=self.cfg.ft_batch,
+                device=device,
+                trainer=FinetuneDetectionTrainer,
+                project=self.cfg.project,
+                name=self.cfg.name + "_finetune",
+                exist_ok=True,
+            )
+            self.ft_time = time.time() - t0
 
         _log(f"✅ Fine-tune tamamlandı: {self.ft_time:.1f}s")
         return self.results
@@ -226,7 +231,7 @@ class SSLFinetunePipeline:
         """Aşama: Direkt detection eğitimi (SSL yok)."""
         data_yaml = data_yaml or (self.dataset_info.data_yaml if self.dataset_info else None)
         if not data_yaml:
-            raise ConfigError("data.yaml bulunamadı")
+            raise ConfigError("data.yaml not found")
 
         _log("\n" + "=" * 60)
         trainer_name = "Contrastive Detection" if use_contrastive else "Base Detection"
@@ -251,19 +256,26 @@ class SSLFinetunePipeline:
         )
 
         if use_contrastive:
-            os.environ["YCL_LAMBDA"] = str(self.cfg.cl_lambda)
-            os.environ["YCL_TEMP"] = str(self.cfg.cl_temperature)
-            os.environ["YCL_TWO_VIEW"] = "1" if self.cfg.cl_two_view else "0"
-            os.environ["YCL_AUG_PRESET"] = self.cfg.cl_aug_preset
-            os.environ["YCL_LAMBDA_ROT"] = str(self.cfg.cl_lambda_rot)
-
             from .trainer import ContrastiveDetectionTrainer
             train_kwargs["trainer"] = ContrastiveDetectionTrainer
 
-        model = YOLO(self.cfg.model)
-        t0 = time.time()
-        self.results = model.train(**train_kwargs)
-        self.ft_time = time.time() - t0
+            # FIX: env var'lar context manager ile geçici set edilir
+            with _env_vars(
+                YCL_LAMBDA=self.cfg.cl_lambda,
+                YCL_TEMP=self.cfg.cl_temperature,
+                YCL_TWO_VIEW="1" if self.cfg.cl_two_view else "0",
+                YCL_AUG_PRESET=self.cfg.cl_aug_preset,
+                YCL_LAMBDA_ROT=self.cfg.cl_lambda_rot,
+            ):
+                model = YOLO(self.cfg.model)
+                t0 = time.time()
+                self.results = model.train(**train_kwargs)
+                self.ft_time = time.time() - t0
+        else:
+            model = YOLO(self.cfg.model)
+            t0 = time.time()
+            self.results = model.train(**train_kwargs)
+            self.ft_time = time.time() - t0
 
         _log(f"✅ {trainer_name} tamamlandı: {self.ft_time:.1f}s")
         return self.results
@@ -274,17 +286,7 @@ class SSLFinetunePipeline:
         unlabeled_dir: Optional[str] = None,
         dataset_dir: Optional[str] = None,
     ):
-        """Otomatik pipeline — dataset yapısına göre mod seçer.
-
-        Args:
-            data_yaml: YOLO data.yaml yolu
-            unlabeled_dir: Etiketsiz görüntü klasörü
-            dataset_dir: Üst dataset klasörü
-
-        Returns:
-            Training results
-        """
-        # 1) Dataset discovery
+        """Auto pipeline — selects mode based on dataset structure."""
         info = self.discover_dataset(
             data_yaml=data_yaml,
             unlabeled_dir=unlabeled_dir,
@@ -293,7 +295,6 @@ class SSLFinetunePipeline:
 
         _log(f"\n🚀 Seçilen mod: {info.mode.value}")
 
-        # 2) Moda göre çalıştır
         if info.mode == TrainMode.SSL_FINETUNE:
             self.run_ssl(images_dir=info.unlabeled_dir)
             return self.run_finetune(data_yaml=info.data_yaml)
@@ -309,7 +310,7 @@ class SSLFinetunePipeline:
             return self.backbone_path
 
     def summary(self) -> dict:
-        """Pipeline sonuç özeti."""
+        """Pipeline result summary."""
         return {
             "mode": self.dataset_info.mode.value if self.dataset_info else None,
             "backbone_path": self.backbone_path,
@@ -327,34 +328,7 @@ def auto_train(
     dataset_dir: Optional[str] = None,
     **kwargs,
 ):
-    """Tek fonksiyonla otomatik eğitim.
-
-    Dataset yapısını algılar ve uygun pipeline'ı çalıştırır:
-        - unlabeled + labeled → SSL Pretrain → Fine-tune
-        - labeled only → Detection training
-        - unlabeled only → Backbone pretrain
-
-    Args:
-        data_yaml: YOLO data.yaml yolu
-        unlabeled_dir: Etiketsiz görüntü klasörü
-        dataset_dir: Üst dataset klasörü
-        **kwargs: PipelineConfig parametreleri
-
-    Returns:
-        Training results
-
-    Kullanım:
-        # En basit — otomatik algılama
-        results = auto_train(dataset_dir="path/to/dataset")
-
-        # Açık yollarla
-        results = auto_train(
-            data_yaml="path/to/data.yaml",
-            unlabeled_dir="path/to/unlabeled",
-            ssl_epochs=50,
-            ft_epochs=30,
-        )
-    """
+    """One-function automatic training."""
     config = PipelineConfig.from_dict(kwargs)
     pipeline = SSLFinetunePipeline(config=config)
 
@@ -364,7 +338,6 @@ def auto_train(
         dataset_dir=dataset_dir,
     )
 
-    # Özet yazdır
     s = pipeline.summary()
     _log("\n" + "=" * 60)
     _log("📊 Pipeline Sonuç")

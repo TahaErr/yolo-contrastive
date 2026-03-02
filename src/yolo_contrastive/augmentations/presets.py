@@ -1,4 +1,4 @@
-"""Hazır augmentation pipeline preset'leri."""
+"""Ready-made augmentation pipeline presets."""
 
 from .registry import AugmentationPipeline
 from .geometric import RandomHorizontalFlip, RandomRotation
@@ -18,7 +18,7 @@ def simclr_v1(imgsz: int = 640) -> AugmentationPipeline:
 
 
 def simclr_v2(imgsz: int = 640) -> AugmentationPipeline:
-    """SimCLR v2 — solarize ekli."""
+    """SimCLR v2 — with solarize."""
     return AugmentationPipeline([
         RandomHorizontalFlip(p=0.5),
         RandomColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
@@ -29,18 +29,18 @@ def simclr_v2(imgsz: int = 640) -> AugmentationPipeline:
 
 
 def byol(imgsz: int = 640) -> AugmentationPipeline:
-    """BYOL paper augmentation."""
+    """BYOL paper augmentation pipeline."""
     return AugmentationPipeline([
         RandomHorizontalFlip(p=0.5),
         RandomColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
         RandomGrayscale(p=0.2),
         RandomGaussianBlur(kernel_size=max(3, imgsz // 64 * 2 + 1), p=1.0),
-        RandomSolarize(threshold=0.5, p=0.0),  # view1'de yok
+        RandomSolarize(threshold=0.5, p=0.0),  # not used in view1
     ])
 
 
 def aggressive() -> AugmentationPipeline:
-    """Agresif augmentation — küçük dataset'ler için."""
+    """Aggressive augmentation — for small datasets."""
     return AugmentationPipeline([
         RandomHorizontalFlip(p=0.5),
         RandomRotation(degrees=15, p=0.3),

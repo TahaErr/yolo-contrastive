@@ -120,6 +120,23 @@ class ContrastiveDetectionTrainer(
         self.cl_cfg = CLConfig.from_env()
         cfg = self.cl_cfg
 
+        # FIX: CL ve rotation ikisi de kapalıysa hook kurma — gereksiz maliyet
+        if not cfg.enabled and not cfg.rotation_enabled:
+            self._cl_inited = True
+            self._rot_params_pending = False
+            self._rot_task = None
+            self._feature_tap = None
+            self._cl_loss_fn = None
+            self._cl_aug_pipeline = None
+            self._cl_step = 0
+            self._cl_last_key = None
+            self._cl_added_for_key = False
+            self._cl_grad_warned = False
+            self._cl_bn_note_printed = False
+            log("[ycl] Init: CL and rotation both disabled (lambda_cl=0, lambda_rot=0). "
+                "No hooks installed.")
+            return
+
         self._cl_loss_fn = build_contrastive_loss(cfg.loss_name, temperature=cfg.temperature)
 
         # Augmentation pipeline

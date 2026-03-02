@@ -26,7 +26,12 @@ def env_float(key, default, *, min_val=None):
         _log_warn(f"[ycl] WARN: {key}={v!r} invalid float, default={default}")
         return float(default)
     if min_val is not None and f < min_val:
-        _log_warn(f"[ycl] WARN: {key}={f} < {min_val}, clamping")
+        import warnings
+        warnings.warn(
+            f"[ycl] {key}={f} is below minimum {min_val}, clamping to {min_val}. "
+            f"Set a valid value to suppress this warning.",
+            UserWarning, stacklevel=3,
+        )
         return float(min_val)
     return f
 
@@ -48,7 +53,12 @@ def env_int(key, default, *, min_val=None):
         _log_warn(f"[ycl] WARN: {key}={v!r} invalid int, default={default}")
         return int(default)
     if min_val is not None and i < min_val:
-        _log_warn(f"[ycl] WARN: {key}={i} < {min_val}, clamping")
+        import warnings
+        warnings.warn(
+            f"[ycl] {key}={i} is below minimum {min_val}, clamping to {min_val}. "
+            f"Set a valid value to suppress this warning.",
+            UserWarning, stacklevel=3,
+        )
         return int(min_val)
     return i
 

@@ -15,7 +15,6 @@ Fixes applied (audit report §1):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
@@ -42,17 +41,14 @@ def _resolve_nc(model) -> Optional[int]:
         v = y.get("nc", None)
         if v is not None:
             try:
-                return int(v)  # handles both int and str like "80"
+                return int(v)
             except (TypeError, ValueError):
                 pass
     return None
 
 
 def _is_head_class(mod: torch.nn.Module, head_class_names: Iterable[str]) -> bool:
-    """Check if *any* class in the module's MRO matches a head class name.
-
-    This catches subclasses like ``DetectDFL(Detect)`` automatically.
-    """
+    """Check if *any* class in the module's MRO matches a head class name."""
     names = set(head_class_names)
     for cls in type(mod).__mro__:
         if cls.__name__ in names:
@@ -74,11 +70,7 @@ def _in_prefix(name: str, prefixes: set[str]) -> bool:
 
 
 def _unwrap_out(out: Any) -> Any:
-    """Extract the most likely feature tensor from a module output.
-
-    Strategy: if output is a tuple/list, pick the **largest 4-D tensor**
-    (by numel) — this avoids silently selecting a small auxiliary output.
-    """
+    """Extract the most likely feature tensor from a module output."""
     if isinstance(out, (tuple, list)) and len(out) > 0:
         best, best_n = None, -1
         for item in out:
@@ -88,7 +80,6 @@ def _unwrap_out(out: Any) -> Any:
                     best, best_n = item, n
         if best is not None:
             return best
-        # Fallback: first tensor of any shape
         for item in out:
             if torch.is_tensor(item):
                 return item
@@ -100,14 +91,7 @@ def _select_layer(
     head_prefixes: set[str],
     min_channels: int,
 ) -> Optional[str]:
-    """Pick the last suitable 4-D feature map outside the head.
-
-    Only criteria:
-      - 4-D tensor output
-      - channels >= min_channels
-      - NOT inside a head module
-    The old ``c != nc`` heuristic has been removed (audit §1.1).
-    """
+    """Pick the last suitable 4-D feature map outside the head."""
     for name in reversed(list(acts.keys())):
         out = _unwrap_out(acts[name])
         if torch.is_tensor(out) and out.ndim == 4:
@@ -130,7 +114,6 @@ def _parse_imgsz(imgsz: Union[int, Tuple[int, int], Sequence[int]]) -> Tuple[int
 # Main class
 # ---------------------------------------------------------------------------
 
-@dataclass
 class FeatureTap:
     """Auto-selects a backbone/neck layer and produces [B, D] embeddings via a forward hook.
 
@@ -139,7 +122,7 @@ class FeatureTap:
         tap = FeatureTap(model, store_grad=True)
         tap.setup(device="cuda", imgsz=640)
         # ... run model forward ...
-        z = tap.last_embedding  # [B, D]
+        z = tap.get_embedding()  # [B, D]
         tap.close()
 
     Or as a context manager::
@@ -149,16 +132,22 @@ class FeatureTap:
             ...
     """
 
-    model: torch.nn.Module
-    min_channels: int = 128
-    store_grad: bool = False
-    head_class_names: Tuple[str, ...] = (
-        "Detect", "Segment", "Pose", "OBB", "Classify",
-    )
-
-    layer_name: Optional[str] = None
-    last_embedding: Optional[torch.Tensor] = None
-    _fixed_hook: Any = field(default=None, repr=False)
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        min_channels: int = 128,
+        store_grad: bool = False,
+        head_class_names: Tuple[str, ...] = (
+            "Detect", "Segment", "Pose", "OBB", "Classify",
+        ),
+    ):
+        self.model = model
+        self.min_channels = min_channels
+        self.store_grad = store_grad
+        self.head_class_names = head_class_names
+        self.layer_name: Optional[str] = None
+        self.last_embedding: Optional[torch.Tensor] = None
+        self._fixed_hook: Any = None
 
     # -- context manager -------------------------------------------------
 
@@ -170,7 +159,6 @@ class FeatureTap:
         return False
 
     def __del__(self) -> None:
-        # Safety net: remove hook if user forgets close()
         try:
             self.close()
         except Exception:
@@ -191,7 +179,6 @@ class FeatureTap:
         h, w = _parse_imgsz(imgsz)
         device = torch.device(device) if isinstance(device, str) else device
 
-        # 1) Collect activations with temporary hooks on ALL non-head modules
         acts: Dict[str, Any] = {}
         hooks = []
 
@@ -203,12 +190,10 @@ class FeatureTap:
             return fn
 
         for name, mod in self.model.named_modules():
-            # Skip head modules and the root module itself
             if name == "" or _in_prefix(name, hp):
                 continue
             hooks.append(mod.register_forward_hook(hook_factory(name)))
 
-        # Probe with random input (avoids norm div-by-zero with zeros)
         x = torch.randn(1, 3, h, w, device=device)
         was_training = self.model.training
         self.model.eval()
@@ -217,14 +202,12 @@ class FeatureTap:
             with torch.no_grad():
                 _ = self.model(x)
         finally:
-            # Always remove temporary hooks — even if forward crashes
             for hook in hooks:
                 hook.remove()
 
         if was_training:
             self.model.train()
 
-        # 2) Select best layer
         sel = _select_layer(acts, head_prefixes=hp, min_channels=self.min_channels)
         if sel is None:
             raise FeatureTapError(
@@ -236,15 +219,13 @@ class FeatureTap:
 
         self.layer_name = sel
 
-        # 3) Attach permanent hook to the selected layer
         mods = dict(self.model.named_modules())
         target = mods[sel]
 
         def fixed_hook(module, inp, out):
             out_t = _unwrap_out(out)
             if torch.is_tensor(out_t) and out_t.ndim == 4:
-                emb = F.adaptive_avg_pool2d(out_t, (1, 1)).flatten(1)  # [B, C]
-                # NOTE: no L2 normalize here — kept only in losses.py (audit §1.5)
+                emb = F.adaptive_avg_pool2d(out_t, (1, 1)).flatten(1)
                 self.last_embedding = emb if self.store_grad else emb.detach()
 
         self._fixed_hook = target.register_forward_hook(fixed_hook)

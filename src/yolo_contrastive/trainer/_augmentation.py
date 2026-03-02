@@ -73,7 +73,7 @@ class AugmentationMixin:
         return x2.clamp(0.0, 1.0)
 
     def make_view2(self, img: torch.Tensor) -> torch.Tensor:
-        """Public: new pipeline veya legacy."""
+        """Public: new pipeline or legacy fallback."""
         if not torch.is_tensor(img):
             return img
         pipeline = getattr(self, "_cl_aug_pipeline", None)

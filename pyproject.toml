@@ -20,9 +20,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-yolo = ["ultralytics>=8.0.0"]
-dev  = ["pytest", "ruff", "pre-commit"]
-all  = ["yolo-contrastive[yolo,dev]"]
+yolo     = ["ultralytics>=8.0.0"]
+pretrain = ["opencv-python>=4.6.0"]
+dev      = ["pytest", "ruff", "pre-commit"]
+all      = ["yolo-contrastive[yolo,pretrain,dev]"]
 
 [project.urls]
 Homepage   = "https://github.com/TahaErr/yolo-contrastive"

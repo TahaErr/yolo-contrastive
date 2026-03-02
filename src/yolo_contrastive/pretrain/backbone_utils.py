@@ -60,7 +60,17 @@ def load_backbone(
     Returns:
         Yüklenen parametre sayısı
     """
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    # FIX: Önce güvenli yüklemeyi dene (weights_only=True), başarısız olursa fallback
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        import warnings
+        warnings.warn(
+            f"torch.load weights_only=True failed for '{path}'. "
+            f"Falling back to weights_only=False — only load checkpoints you trust.",
+            UserWarning, stacklevel=2,
+        )
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
 
     # Checkpoint formatını tespit et
     if "model_state_dict" in checkpoint:

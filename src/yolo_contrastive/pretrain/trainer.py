@@ -1,13 +1,4 @@
-"""SSLPretrainer — Etiketsiz verilerle backbone pretraining.
-
-Pipeline:
-    img → augment(view1, view2) → backbone → features → projection → CL loss
-    img → rotate → backbone → features → rotation_head → CE loss
-
-    total_loss = cl_loss + λ_rot × rot_loss
-
-Backbone ağırlıkları kaydedilir → fine-tune aşamasında kullanılır.
-"""
+"""SSLPretrainer — Backbone pretraining with unlabeled data."""
 
 from __future__ import annotations
 
@@ -23,18 +14,6 @@ from .backbone_utils import save_backbone
 
 
 class SSLPretrainer:
-    """Self-supervised pretrainer for YOLO backbone.
-
-    Kullanım:
-        pretrainer = SSLPretrainer(model="yolov8n.pt")
-        pretrainer.train(
-            images_dir="path/to/unlabeled/images",
-            epochs=100,
-            batch_size=32,
-            output="pretrained_backbone.pt",
-        )
-    """
-
     def __init__(
         self,
         model: str = "yolov8n.pt",
@@ -52,38 +31,31 @@ class SSLPretrainer:
         self.lambda_cl = lambda_cl
         self.lambda_rot = lambda_rot
 
-        # Device
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
-            # "0" veya "cuda:0" gibi farklı formatları destekle
             if isinstance(device, (int, float)) or (isinstance(device, str) and device.isdigit()):
                 self.device = torch.device(f"cuda:{int(device)}")
             else:
                 self.device = torch.device(device)
 
-        # YOLO model yükle
         from ultralytics import YOLO
         yolo = YOLO(model)
         self.model = yolo.model.to(self.device)
         self.model.train()
-        # Backbone parametrelerini eğitilebilir yap
         for param in self.model.parameters():
             param.requires_grad = True
         trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
-        print(f"[ycl] Model: {model} → {self.device} ({trainable} trainable params)")
+        print(f"[ycl] Model: {model} -> {self.device} ({trainable} trainable params)")
 
-        # Feature tap — backbone'dan embedding çıkar
         from ..feature_tap import FeatureTap
         self.feature_tap = FeatureTap(self.model, min_channels=128, store_grad=True)
         self.feature_tap.setup(device=self.device, imgsz=imgsz)
         print(f"[ycl] FeatureTap: {self.feature_tap.layer_name}")
 
-        # feat_dim tespit et
         self.feat_dim = self._detect_feat_dim()
         print(f"[ycl] Feature dim: {self.feat_dim}")
 
-        # Projection head (SimCLR-style, pretraining sonrası ATILIR)
         from ..pretext.heads import ProjectionHead
         self.projection_head = ProjectionHead(
             feat_dim=self.feat_dim,
@@ -91,11 +63,9 @@ class SSLPretrainer:
             hidden_dim=proj_hidden,
         ).to(self.device)
 
-        # CL loss
         from ..contrastive.losses import build_contrastive_loss
         self.cl_loss_fn = build_contrastive_loss("ntxent", temperature=temperature)
 
-        # Rotation task (opsiyonel)
         self.rot_task = None
         if lambda_rot > 0:
             from ..pretext.rotation import RotationTask
@@ -104,13 +74,11 @@ class SSLPretrainer:
                 hidden_dim=rot_hidden,
             ).to(self.device)
 
-        # Augmentation pipeline
         from ..augmentations.presets import build_pipeline
         self.augmentation = build_pipeline(aug_preset, imgsz=imgsz)
         print(f"[ycl] Augmentation: {aug_preset} ({len(self.augmentation)} ops)")
 
     def cleanup(self):
-        """Manuel cleanup — hook'ları temizle."""
         if hasattr(self, "feature_tap"):
             self.feature_tap.close()
 
@@ -121,20 +89,19 @@ class SSLPretrainer:
             pass
 
     def _detect_feat_dim(self) -> int:
-        """Dummy forward ile feature boyutunu tespit et."""
+        # FIX: BN running stats'ları koruyarak dummy forward yap
+        from ..trainer._helpers import preserve_bn_running_stats
         self.model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), preserve_bn_running_stats(self.model):
             dummy = torch.randn(1, 3, self.imgsz, self.imgsz, device=self.device)
             _ = self.model(dummy)
         self.model.train()
-
         emb = self.feature_tap.get_embedding()
         if emb is None:
-            raise RuntimeError("[ycl] FeatureTap returned None — model forward failed")
+            raise RuntimeError("[ycl] FeatureTap returned None")
         return emb.shape[1]
 
     def _get_embedding(self, imgs: torch.Tensor) -> torch.Tensor:
-        """Forward + FeatureTap ile embedding çıkar."""
         _ = self.model(imgs)
         emb = self.feature_tap.get_embedding()
         if emb is None:
@@ -154,20 +121,13 @@ class SSLPretrainer:
         save_every: int = 25,
         print_every: int = 10,
     ) -> str:
-        """Etiketsiz verilerle backbone pretraining."""
-        # Dataset
         dataset = UnlabeledImageDataset(images_dir, imgsz=self.imgsz)
         dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=True,
+            dataset, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=True, drop_last=True,
         )
         print(f"[ycl] Dataset: {len(dataset)} images, {len(dataloader)} batches/epoch")
 
-        # Optimizer
         param_groups = [
             {"params": self.model.parameters(), "lr": lr},
             {"params": self.projection_head.parameters(), "lr": lr},
@@ -177,7 +137,6 @@ class SSLPretrainer:
 
         optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
 
-        # Cosine scheduler with warmup
         total_steps = epochs * len(dataloader)
         warmup_steps = warmup_epochs * len(dataloader)
 
@@ -187,17 +146,20 @@ class SSLPretrainer:
             progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
             return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        # FIX: LambdaLR.__init__ dahili step() çağırır → optimizer henüz step atmadığı
+        # için PyTorch uyarı verir. Uyarıyı init sırasında bastır, loop sırası doğrudur.
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-        # AMP scaler
         use_amp = self.device.type == "cuda"
         try:
             scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         except TypeError:
             scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-        # Training loop
-        print("\n[ycl] === SSL Pretraining Start ===")
+        print(f"\n[ycl] === SSL Pretraining Start ===")
         print(f"[ycl] epochs={epochs}, batch={batch_size}, lr={lr}")
         print(f"[ycl] lambda_cl={self.lambda_cl}, lambda_rot={self.lambda_rot}")
         print(f"[ycl] output={output}\n")
@@ -224,37 +186,41 @@ class SSLPretrainer:
                     imgs = imgs.to(self.device, non_blocking=True)
                     optimizer.zero_grad()
 
-                    with torch.amp.autocast(self.device.type, enabled=use_amp):
-                        # View 1
+                    # FIX: Augmentations OUTSIDE autocast and inside no_grad
+                    with torch.no_grad():
                         view1 = self.augmentation(imgs)
+                        view2 = self.augmentation(imgs)
+
+                    rot_imgs = None
+                    rot_labels = None
+                    if self.rot_task is not None:
+                        with torch.no_grad():
+                            rot_imgs, rot_labels = self.rot_task.rotate_batch(imgs)
+
+                    with torch.amp.autocast(self.device.type, enabled=use_amp):
                         z1 = self._get_embedding(view1)
                         p1 = self.projection_head(z1)
 
-                        # View 2
-                        view2 = self.augmentation(imgs)
                         z2 = self._get_embedding(view2)
                         p2 = self.projection_head(z2)
 
-                        # Contrastive loss
                         cl_loss = self.cl_loss_fn(p1, p2)
 
-                        # Rotation loss
                         rot_loss = torch.tensor(0.0, device=self.device)
                         rot_acc = 0.0
-                        if self.rot_task is not None:
-                            rot_imgs, rot_labels = self.rot_task.rotate_batch(imgs)
+                        if self.rot_task is not None and rot_imgs is not None:
                             rot_features = self._get_embedding(rot_imgs)
                             rot_loss, rot_acc = self.rot_task(rot_features, rot_labels)
 
-                        # Total
                         total = self.lambda_cl * cl_loss + self.lambda_rot * rot_loss
 
                     scaler.scale(total).backward()
                     scaler.step(optimizer)
                     scaler.update()
-                    scheduler.step()
+                    with _warnings.catch_warnings():
+                        _warnings.simplefilter("ignore")
+                        scheduler.step()
 
-                    # Accumulate
                     global_step += 1
                     n_batches += 1
                     epoch_cl_loss += cl_loss.item()
@@ -272,7 +238,6 @@ class SSLPretrainer:
                             f"lr={lr_now:.2e}"
                         )
 
-                # Epoch stats
                 n = max(1, n_batches)
                 avg_cl = epoch_cl_loss / n
                 avg_rot = epoch_rot_loss / n
@@ -286,7 +251,6 @@ class SSLPretrainer:
                     f"total={avg_total:.4f} | {elapsed:.1f}s"
                 )
 
-                # Checkpoint
                 if save_every > 0 and epoch % save_every == 0:
                     ckpt = output.replace(".pt", f"_ep{epoch}.pt")
                     save_backbone(self.model, ckpt, epoch=epoch, extra={
@@ -297,7 +261,6 @@ class SSLPretrainer:
                 if avg_total < best_loss:
                     best_loss = avg_total
 
-            # Final save
             total_time = time.time() - t0_total
             save_backbone(self.model, output, epoch=epochs, extra={
                 "total_time_sec": total_time,
@@ -305,13 +268,11 @@ class SSLPretrainer:
                 "lambda_cl": self.lambda_cl,
                 "lambda_rot": self.lambda_rot,
             })
-            print("\n[ycl] === SSL Pretraining Complete ===")
+            print(f"\n[ycl] === SSL Pretraining Complete ===")
             print(f"[ycl] {epochs} epochs in {total_time/60:.1f} min")
             print(f"[ycl] Best loss: {best_loss:.4f}")
             print(f"[ycl] Backbone saved: {output}")
-
             return output
 
         finally:
             self.feature_tap.close()
-

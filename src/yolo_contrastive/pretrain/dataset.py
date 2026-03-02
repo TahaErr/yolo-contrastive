@@ -13,12 +13,7 @@ from torch.utils.data import Dataset
 
 
 class UnlabeledImageDataset(Dataset):
-    """Klasördeki tüm görüntüleri recursive yükler.
-
-    Kullanım:
-        ds = UnlabeledImageDataset("/path/to/images", imgsz=640)
-        img = ds[0]  # [3, 640, 640] float32 tensor, range [0, 1]
-    """
+    """Klasördeki tüm görüntüleri recursive yükler."""
 
     EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
@@ -39,24 +34,32 @@ class UnlabeledImageDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        path = str(self.files[idx])
-        img = cv2.imread(path)
+        # FIX: Bozuk dosyada random tensor yerine komşu index'e fallback
+        max_retries = 3
+        for attempt in range(max_retries):
+            try_idx = (idx + attempt) % len(self.files)
+            path = str(self.files[try_idx])
+            img = cv2.imread(path)
 
-        if img is None:
-            warnings.warn(
-                f"Bozuk/okunamayan dosya: {path} — rastgele tensor döndürülüyor.",
-                UserWarning, stacklevel=2,
-            )
-            return torch.rand(3, self.imgsz, self.imgsz)
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = cv2.resize(img, (self.imgsz, self.imgsz),
+                                 interpolation=cv2.INTER_LINEAR)
+                img = img.astype(np.float32) / 255.0
+                return torch.from_numpy(img).permute(2, 0, 1).contiguous()
 
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if attempt == 0:
+                warnings.warn(
+                    f"Corrupt/unreadable file: {path} — trying next image.",
+                    UserWarning, stacklevel=2,
+                )
 
-        # Letterbox yerine basit resize (pretraining için yeterli)
-        img = cv2.resize(img, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
-
-        # HWC uint8 → CHW float32 [0, 1]
-        img = img.astype(np.float32) / 255.0
-        return torch.from_numpy(img).permute(2, 0, 1).contiguous()
+        # Tüm retry'lar başarısız — son çare
+        warnings.warn(
+            f"All retries failed around index {idx}. Returning zero tensor.",
+            UserWarning, stacklevel=2,
+        )
+        return torch.zeros(3, self.imgsz, self.imgsz)
 
     def __repr__(self) -> str:
         return f"UnlabeledImageDataset(n={len(self)}, imgsz={self.imgsz})"

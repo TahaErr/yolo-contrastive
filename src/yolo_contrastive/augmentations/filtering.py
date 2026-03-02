@@ -4,6 +4,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from .registry import PerImageAugmentation, register
+import os
 
 
 @register("gaussian_blur")
@@ -18,7 +19,6 @@ class RandomGaussianBlur(PerImageAugmentation):
         B, C, H, W = img.shape
         k = self.kernel_size
         pad = k // 2
-
         results = []
         for i in range(B):
             sigma = torch.empty(1).uniform_(self.sigma_lo, self.sigma_hi).item()
@@ -45,15 +45,23 @@ class GaussianNoise(PerImageAugmentation):
 
 @register("sharpen")
 class RandomSharpen(PerImageAugmentation):
-    """Unsharp masking ile keskinleştirme."""
+    """Unsharp masking ile keskinleştirme.
+
+    Doğru unsharp mask formülü:
+        sharpened = img + strength * (img - blurred)
+    """
     def __init__(self, strength: float = 1.0, p: float = 0.3):
         super().__init__(p=p)
         self.strength = strength
 
     def apply(self, img: torch.Tensor) -> torch.Tensor:
         B, C, H, W = img.shape
-        kernel = torch.tensor([[0, -1, 0], [-1, 5, -1], [0, -1, 0]],
-                              device=img.device, dtype=img.dtype)
-        kernel = kernel.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
-        sharpened = F.conv2d(F.pad(img, (1, 1, 1, 1), mode="reflect"), kernel, groups=C)
-        return img + self.strength * (sharpened - img)
+        blur_kernel = torch.tensor(
+            [[1, 2, 1],
+             [2, 4, 2],
+             [1, 2, 1]],
+            device=img.device, dtype=img.dtype,
+        ) / 16.0
+        blur_kernel = blur_kernel.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
+        blurred = F.conv2d(F.pad(img, (1, 1, 1, 1), mode="reflect"), blur_kernel, groups=C)
+        return img + self.strength * (img - blurred)

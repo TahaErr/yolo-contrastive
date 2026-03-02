@@ -1,8 +1,9 @@
-"""CSV logging mixin — per-step loss tracking."""
+"""CSV logging mixin — per-step loss tracking (thread-safe)."""
 
 from __future__ import annotations
 import csv
 import os
+import threading
 
 
 def _is_main_process(trainer) -> bool:
@@ -18,6 +19,10 @@ def _is_main_process(trainer) -> bool:
     return r in (-1, 0)
 
 
+# FIX: Modül seviyesinde lock — DataParallel'da concurrent write'ları önler
+_csv_lock = threading.Lock()
+
+
 class CSVLoggerMixin:
 
     def _csv_init_if_needed(self) -> None:
@@ -27,13 +32,17 @@ class CSVLoggerMixin:
         if not path or os.path.exists(path):
             return
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", newline="") as f:
-            csv.writer(f).writerow([
-                "step", "epoch", "iter_tag", "iter_a", "iter_b", "source",
-                "det_loss", "cl_loss", "rot_loss", "total_loss",
-                "lambda_cl", "lambda_rot", "temp",
-                "tap_layer", "two_view", "aug_preset", "rot_acc",
-            ])
+        with _csv_lock:
+            # Double-check after acquiring lock
+            if os.path.exists(path):
+                return
+            with open(path, "w", newline="") as f:
+                csv.writer(f).writerow([
+                    "step", "epoch", "iter_tag", "iter_a", "iter_b", "source",
+                    "det_loss", "cl_loss", "rot_loss", "total_loss",
+                    "lambda_cl", "lambda_rot", "temp",
+                    "tap_layer", "two_view", "aug_preset", "rot_acc",
+                ])
 
     def _csv_append(self, row: list) -> None:
         if not _is_main_process(self):
@@ -41,5 +50,6 @@ class CSVLoggerMixin:
         path = getattr(self, "_cl_csv_path", None)
         if not path:
             return
-        with open(path, "a", newline="") as f:
-            csv.writer(f).writerow(row)
+        with _csv_lock:
+            with open(path, "a", newline="") as f:
+                csv.writer(f).writerow(row)

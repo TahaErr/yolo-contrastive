@@ -123,13 +123,18 @@ class RandomPosterize(PerImageAugmentation):
 
 @register("equalize")
 class RandomEqualize(PerImageAugmentation):
-    """Histogram equalization (approximate, differentiable)."""
+    """Histogram equalization (approximate).
+
+    NOT: .long() cast ve integer indexing gradient chain'i keser.
+    Bu augmentation zaten torch.no_grad() içinde kullanılmalıdır.
+    """
     def __init__(self, p: float = 0.2):
         super().__init__(p=p)
 
     def apply(self, img: torch.Tensor) -> torch.Tensor:
         B, C, H, W = img.shape
-        flat = img.view(B, C, -1)
+        # FIX: Detach ile açıkça gradient chain'i kes
+        flat = img.detach().view(B, C, -1)
         n_pixels = H * W
         n_bins = 256
 

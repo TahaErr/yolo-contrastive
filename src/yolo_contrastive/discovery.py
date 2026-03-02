@@ -20,7 +20,7 @@ from .exceptions import ConfigError
 
 
 class TrainMode(Enum):
-    """Otomatik belirlenen eğitim modu."""
+    """Auto-determined training mode."""
     SSL_FINETUNE = "ssl_finetune"       # unlabeled + labeled
     DETECTION = "detection"              # sadece labeled
     SSL_ONLY = "ssl_only"               # sadece unlabeled
@@ -30,7 +30,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
 
 def _count_images(path: str) -> int:
-    """Klasördeki görüntü sayısını recursive say."""
+    """Recursively count images in directory."""
     if not os.path.isdir(path):
         return 0
     count = 0
@@ -41,7 +41,7 @@ def _count_images(path: str) -> int:
 
 
 def _resolve_path(base_dir: str, rel_path: str) -> str:
-    """Relative yolu base_dir'e göre çöz."""
+    """Resolve relative path against base_dir."""
     p = Path(rel_path)
     if p.is_absolute():
         return str(p)
@@ -50,7 +50,7 @@ def _resolve_path(base_dir: str, rel_path: str) -> str:
 
 @dataclass
 class DatasetInfo:
-    """Dataset analiz sonucu."""
+    """Dataset analysis result."""
 
     mode: TrainMode
     data_yaml: Optional[str] = None
@@ -90,7 +90,7 @@ def discover(
     unlabeled_dir: Optional[str] = None,
     dataset_dir: Optional[str] = None,
 ) -> DatasetInfo:
-    """Dataset yapısını analiz et ve eğitim modunu belirle.
+    """Analyze dataset structure and determine training mode.
 
     Args:
         data_yaml: YOLO data.yaml yolu (None ise dataset_dir'de arar)

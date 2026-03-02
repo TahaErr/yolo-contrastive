@@ -67,11 +67,11 @@ class GridMask(PerImageAugmentation):
     def apply(self, img: torch.Tensor) -> torch.Tensor:
         B, C, H, W = img.shape
         mask_h = int(self.grid_size * self.ratio)
+        mask_w = int(self.grid_size * self.ratio)
         mask = torch.ones(H, W, device=img.device, dtype=img.dtype)
         for y in range(0, H, self.grid_size):
             for x in range(0, W, self.grid_size):
-                mask[y:y+mask_h, x:x+mask_h] = 0.0
-        # Rastgele offset
+                mask[y:y+mask_h, x:x+mask_w] = 0.0
         off_y = torch.randint(0, self.grid_size, (1,)).item()
         off_x = torch.randint(0, self.grid_size, (1,)).item()
         mask = torch.roll(mask, shifts=(off_y, off_x), dims=(0, 1))
