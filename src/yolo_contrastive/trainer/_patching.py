@@ -1,4 +1,4 @@
-"""Model patching: forward/loss → inject CL + rotation."""
+"""Model patching: forward/loss → inject CL + pretext tasks."""
 
 from __future__ import annotations
 
@@ -44,9 +44,14 @@ class PatchingMixin:
         log("[ycl] Model patches removed.")
 
     def _inject_all(self, model_self, out, orig_forward, batch=None, source="forward"):
-        """Shared: det → CL → rotation → total = det + λ_cl*cl + λ_rot*rot."""
+        """Shared: det → CL → pretext → total = det + λ_cl*cl + λ_pretext*pretext."""
         cfg = getattr(self, "cl_cfg", None)
-        if cfg is None or not (cfg.enabled or cfg.rotation_enabled):
+        if cfg is None:
+            return out
+
+        # Herhangi bir loss aktif mi?
+        any_active = cfg.enabled or cfg.pretext_enabled or cfg.rotation_enabled
+        if not any_active:
             return out
 
         # Çift enjeksiyon koruması
@@ -64,7 +69,7 @@ class PatchingMixin:
         # Grad warning (once)
         if is_main_process(self) and not getattr(self, "_cl_grad_warned", False):
             if not bool(getattr(z1, "requires_grad", False)):
-                log("[ycl] WARN: z1.requires_grad=False → won't affect backbone.")
+                log("[ycl] WARN: z1.requires_grad=False → gradient will not affect backbone.")
                 self._cl_grad_warned = True
 
         # ── Contrastive ──
@@ -85,29 +90,36 @@ class PatchingMixin:
                     z2 = self._feature_tap.get_embedding()
             cl_loss = self._compute_cl(z1, z2=z2)
 
-        # ── Rotation ──
-        rot_loss = None
-        rot_acc = 0.0
-        if cfg.rotation_enabled:
+        # ── Pretext (composite veya legacy rotation) ──
+        pretext_loss = None
+        pretext_acc = 0.0
+        pretext_detail = ""
+        if cfg.pretext_enabled or cfg.rotation_enabled:
             img = getattr(self, "_cl_last_img", None)
             if img is None and isinstance(batch, dict):
                 img = batch.get("img")
             if torch.is_tensor(img):
-                rot_loss, rot_acc = self._compute_rotation(img, model_self, orig_forward)
+                pretext_loss, pretext_acc, pretext_detail = self._compute_pretext(
+                    img, model_self, orig_forward
+                )
 
         # ── Combine ──
-        if cl_loss is None and rot_loss is None:
+        if cl_loss is None and pretext_loss is None:
             return out
 
         self._mark_cl_added()
         det_s = det_loss if det_loss.numel() == 1 else det_loss.mean()
         total = det_s.clone()
+
         if cl_loss is not None:
             total = total + cfg.lambda_cl * cl_loss
-        if rot_loss is not None:
-            total = total + cfg.lambda_rot * rot_loss
 
-        self._record_step(det_s, cl_loss, rot_loss, total, rot_acc, source=source)
+        if pretext_loss is not None:
+            lambda_pt = cfg.lambda_pretext if cfg.pretext_enabled else cfg.lambda_rot
+            total = total + lambda_pt * pretext_loss
+
+        self._record_step(det_s, cl_loss, pretext_loss, total, pretext_acc,
+                          source=source, pretext_detail=pretext_detail)
         return replace_in_output(out, idx, total)
 
     def _patch_forward_for_loss_return(self, base_model) -> None:

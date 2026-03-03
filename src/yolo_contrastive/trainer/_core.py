@@ -1,4 +1,4 @@
-"""ContrastiveDetectionTrainer — CL + rotation pretext + pluggable augmentation."""
+"""ContrastiveDetectionTrainer — CL + composite pretext + pluggable augmentation."""
 
 from __future__ import annotations
 
@@ -53,10 +53,8 @@ def _add_params_to_optimizer(optimizer, params, scheduler=None, log_prefix=""):
         "lr": lr,
         "initial_lr": lr,
     })
-    # Scheduler'ın base_lrs ve lr_lambdas listelerini güncelle — yoksa zip() hata verir
     if scheduler is not None and hasattr(scheduler, "base_lrs"):
         scheduler.base_lrs.append(lr)
-        # LambdaLR ise lr_lambdas da senkron olmalı
         if hasattr(scheduler, "lr_lambdas") and scheduler.lr_lambdas:
             scheduler.lr_lambdas.append(scheduler.lr_lambdas[-1])
     log(f"{log_prefix}Added {len(param_list)} params to optimizer (lr={lr}).")
@@ -65,9 +63,9 @@ def _add_params_to_optimizer(optimizer, params, scheduler=None, log_prefix=""):
 class ContrastiveDetectionTrainer(
     AugmentationMixin, PatchingMixin, CSVLoggerMixin, DetectionTrainer,
 ):
-    """YOLO trainer + contrastive loss + rotation pretext task.
+    """YOLO trainer + contrastive loss + composite pretext tasks.
 
-    Loss:  total = det_loss + λ_cl × cl_loss + λ_rot × rot_loss
+    Loss:  total = det_loss + λ_cl × cl_loss + λ_pretext × composite_loss
     """
 
     # ── step dedup ──
@@ -120,23 +118,6 @@ class ContrastiveDetectionTrainer(
         self.cl_cfg = CLConfig.from_env()
         cfg = self.cl_cfg
 
-        # FIX: CL ve rotation ikisi de kapalıysa hook kurma — gereksiz maliyet
-        if not cfg.enabled and not cfg.rotation_enabled:
-            self._cl_inited = True
-            self._rot_params_pending = False
-            self._rot_task = None
-            self._feature_tap = None
-            self._cl_loss_fn = None
-            self._cl_aug_pipeline = None
-            self._cl_step = 0
-            self._cl_last_key = None
-            self._cl_added_for_key = False
-            self._cl_grad_warned = False
-            self._cl_bn_note_printed = False
-            log("[ycl] Init: CL and rotation both disabled (lambda_cl=0, lambda_rot=0). "
-                "No hooks installed.")
-            return
-
         self._cl_loss_fn = build_contrastive_loss(cfg.loss_name, temperature=cfg.temperature)
 
         # Augmentation pipeline
@@ -147,7 +128,7 @@ class ContrastiveDetectionTrainer(
                 self._cl_aug_pipeline = build_pipeline(cfg.aug_preset)
                 log(f"[ycl] Aug pipeline: {cfg.aug_preset} → {self._cl_aug_pipeline}")
             except Exception as e:
-                log(f"[ycl] WARN: preset '{cfg.aug_preset}' failed: {e}. Using legacy.")
+                log(f"[ycl] WARN: preset {cfg.aug_preset!r} failed: {e}. Using legacy.")
 
         # Feature tap
         self._cl_img_normalized = True
@@ -157,19 +138,35 @@ class ContrastiveDetectionTrainer(
         base_model = _unwrap_model(self.model)
         self._feature_tap = FeatureTap(
             base_model, min_channels=128,
-            store_grad=(cfg.enabled or cfg.rotation_enabled),
+            store_grad=(cfg.enabled or cfg.pretext_enabled or cfg.rotation_enabled),
         )
         self._feature_tap.setup(device=device, imgsz=imgsz)
 
-        # Rotation pretext
-        self._rot_task = None
-        self._rot_params_pending = False
-        if cfg.rotation_enabled:
+        # ── Pretext task oluştur ──
+        self._pretext_task = None
+        self._rot_task = None  # backward compat
+        self._pretext_params_pending = False
+
+        if cfg.pretext_enabled:
+            # Yeni: CompositeTask
+            feat_dim = self._get_feat_dim(batch)
+            from ..pretext.composite import CompositeTask
+            self._pretext_task = CompositeTask.from_names(
+                names=cfg.pretext_tasks,
+                feat_dim=feat_dim,
+                hidden_dim=cfg.rot_hidden_dim,
+                weights=cfg.pretext_weights,
+            ).to(device)
+            self._pretext_params_pending = True
+            log(f"[ycl] Pretext: {self._pretext_task.log_summary()} λ={cfg.lambda_pretext}")
+
+        elif cfg.rotation_enabled:
+            # Legacy: sadece RotationTask
             feat_dim = self._get_feat_dim(batch)
             from ..pretext.rotation import RotationTask
             self._rot_task = RotationTask(feat_dim=feat_dim, hidden_dim=cfg.rot_hidden_dim).to(device)
-            self._rot_params_pending = True
-            log(f"[ycl] Rotation pretext: λ_rot={cfg.lambda_rot}, feat_dim={feat_dim}")
+            self._pretext_params_pending = True
+            log(f"[ycl] Rotation pretext (legacy): λ_rot={cfg.lambda_rot}, feat_dim={feat_dim}")
 
         # State
         self._cl_step = 0
@@ -186,15 +183,19 @@ class ContrastiveDetectionTrainer(
 
         self._cl_inited = True
 
+        pretext_str = "none"
+        if self._pretext_task:
+            pretext_str = self._pretext_task.log_summary()
+        elif self._rot_task:
+            pretext_str = f"rotation(legacy,λ={cfg.lambda_rot})"
+
         log(
             f"[ycl] Init: cl={cfg.enabled}(λ={cfg.lambda_cl}) "
-            f"rot={cfg.rotation_enabled}(λ={cfg.lambda_rot}) "
+            f"pretext={pretext_str} "
             f"loss={cfg.loss_name} temp={cfg.temperature} "
             f"tap={self._feature_tap.layer_name} "
-            f"2v={cfg.two_view} preset={cfg.aug_preset or 'legacy'}"
+            f"2v={cfg.two_view} preset={cfg.aug_preset or "legacy" }"
         )
-        if cfg.enabled and not cfg.two_view and cfg.pseudo_view:
-            log("[ycl] NOTE: pseudo view. Set YCL_TWO_VIEW=1 for real augmentation.")
 
         self._install_model_patches()
 
@@ -217,12 +218,21 @@ class ContrastiveDetectionTrainer(
         self._touch_step_key(batch)
         self._cl_last_img = batch.get("img", None)
 
-        if self._rot_params_pending and self._rot_task is not None:
+        if self._pretext_params_pending:
             opt = getattr(self, "optimizer", None)
             if opt is not None:
                 sched = getattr(self, "scheduler", None)
-                _add_params_to_optimizer(opt, self._rot_task.parameters(), scheduler=sched, log_prefix="[ycl] ")
-                self._rot_params_pending = False
+                if self._pretext_task is not None:
+                    _add_params_to_optimizer(
+                        opt, self._pretext_task.parameters(),
+                        scheduler=sched, log_prefix="[ycl] "
+                    )
+                elif self._rot_task is not None:
+                    _add_params_to_optimizer(
+                        opt, self._rot_task.parameters(),
+                        scheduler=sched, log_prefix="[ycl] "
+                    )
+                self._pretext_params_pending = False
 
         return batch
 
@@ -238,64 +248,111 @@ class ContrastiveDetectionTrainer(
             z2 = z1
         return self._cl_loss_fn(z1, z2)
 
-    # ── Rotation ──
+    # ── Pretext (yeni) ──
 
-    def _compute_rotation(self, img, model_self, orig_forward):
-        """Rotate → forward (BN preserved) → predict → CE loss.
+    def _compute_pretext(self, img, model_self, orig_forward):
+        """CompositeTask veya legacy RotationTask ile pretext loss hesapla.
 
         Returns:
-            Tuple[Optional[Tensor], float]: (rot_loss, rot_accuracy)
-            Always returns a tuple — never bare None.
+            Tuple[Optional[Tensor], float, str]:
+                (pretext_loss, avg_accuracy, detail_string)
         """
         from ._helpers import preserve_bn_running_stats
 
-        if self._rot_task is None:
-            return None, 0.0
-        if not self.cl_cfg.rotation_enabled:
-            return None, 0.0
         if not torch.is_tensor(img):
-            return None, 0.0
+            return None, 0.0, ""
 
-        rotated_img, rot_labels = self._rot_task.rotate_batch(img)
+        # ── Yeni: CompositeTask ──
+        if self._pretext_task is not None:
+            augmented_img, labels_dict = self._pretext_task.transform(img)
 
-        with preserve_bn_running_stats(model_self):
-            _ = orig_forward(rotated_img)
+            with preserve_bn_running_stats(model_self):
+                _ = orig_forward(augmented_img)
 
-        rot_features = self._feature_tap.get_embedding()
-        if rot_features is None:
-            return None, 0.0
+            features = self._feature_tap.get_embedding()
+            if features is None:
+                return None, 0.0, ""
 
-        rot_loss, rot_acc = self._rot_task(rot_features, rot_labels)
-        return rot_loss, rot_acc
+            total_loss, avg_acc, details = self._pretext_task(features, labels_dict)
+
+            # Detail string for logging
+            parts = []
+            for n, d in details.items():
+                lv = d["loss"].item()
+                av = d["acc"]
+                parts.append(f"{n}={lv:.3f}({av:.0%})")
+            detail_str = " ".join(parts)
+
+            return total_loss, avg_acc, detail_str
+
+        # ── Legacy: RotationTask ──
+        if self._rot_task is not None and self.cl_cfg.rotation_enabled:
+            rotated_img, rot_labels = self._rot_task.rotate_batch(img)
+
+            with preserve_bn_running_stats(model_self):
+                _ = orig_forward(rotated_img)
+
+            rot_features = self._feature_tap.get_embedding()
+            if rot_features is None:
+                return None, 0.0, ""
+
+            rot_loss, rot_acc = self._rot_task(rot_features, rot_labels)
+            return rot_loss, rot_acc, f"rot={rot_loss.item():.3f}({rot_acc:.0%})"
+
+        return None, 0.0, ""
+
+    # ── Legacy compat ──
+
+    def _compute_rotation(self, img, model_self, orig_forward):
+        """Legacy wrapper — _compute_pretext'e yönlendirir.
+
+        Returns:
+            Tuple[Optional[Tensor], float]
+        """
+        loss, acc, _ = self._compute_pretext(img, model_self, orig_forward)
+        return loss, acc
 
     # ── Recording ──
 
-    def _record_step(self, det_loss, cl_loss, rot_loss, total, rot_acc, source):
+    def _record_step(self, det_loss, cl_loss, pretext_loss, total, pretext_acc, source,
+                     pretext_detail=""):
         self._cl_step += 1
         cfg = self.cl_cfg
         det_f = safe_scalar(det_loss)
         cl_f = safe_scalar(cl_loss)
-        rot_f = safe_scalar(rot_loss)
+        pt_f = safe_scalar(pretext_loss)
         tot_f = safe_scalar(total)
 
         if self._cl_step == 1 or (cfg.print_every > 0 and self._cl_step % cfg.print_every == 0):
             parts = [f"step={self._cl_step}", f"det={det_f:.4f}"]
             if cfg.enabled:
                 parts.append(f"cl={cl_f:.4f}(λ={cfg.lambda_cl:.3f})")
-            if cfg.rotation_enabled:
-                parts.append(f"rot={rot_f:.4f}(λ={cfg.lambda_rot:.3f},acc={rot_acc:.1%})")
+            if cfg.pretext_enabled:
+                parts.append(f"pretext={pt_f:.4f}(λ={cfg.lambda_pretext:.3f})")
+                if pretext_detail:
+                    parts.append(f"[{pretext_detail}]")
+            elif cfg.rotation_enabled:
+                parts.append(f"rot={pt_f:.4f}(λ={cfg.lambda_rot:.3f},acc={pretext_acc:.1%})")
             parts.append(f"total={tot_f:.4f}")
-            log(f"[ycl] {' '.join(parts)}")
+            log("[ycl] " + " ".join(parts))
 
         tag, a, b = self._trainer_step_id()
         ep = int(getattr(self, "epoch", -1)) if getattr(self, "epoch", None) is not None else -1
+
+        # CSV: pretext info
+        lambda_pt = cfg.lambda_pretext if cfg.pretext_enabled else cfg.lambda_rot
+        pretext_name = ",".join(cfg.pretext_tasks) if cfg.pretext_enabled else "rotation"
+        if not cfg.pretext_enabled and not cfg.rotation_enabled:
+            pretext_name = "none"
+
         self._csv_append([
             self._cl_step, ep, tag, a, b, source,
-            det_f, cl_f, rot_f, tot_f,
-            cfg.lambda_cl, cfg.lambda_rot, cfg.temperature,
+            det_f, cl_f, pt_f, tot_f,
+            cfg.lambda_cl, lambda_pt, cfg.temperature,
             self._feature_tap.layer_name,
             int(cfg.two_view), cfg.aug_preset or "legacy",
-            f"{rot_acc:.4f}" if cfg.rotation_enabled else "",
+            f"{pretext_acc:.4f}" if (cfg.pretext_enabled or cfg.rotation_enabled) else "",
+            pretext_name,
         ])
 
     def cleanup(self):
