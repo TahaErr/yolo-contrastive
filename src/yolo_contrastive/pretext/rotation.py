@@ -55,7 +55,7 @@ class RotationTask(BasePretextTask):
         labels: torch.Tensor,
     ) -> Tuple[torch.Tensor, float]:
         logits = self.head(features)
-        loss = F.cross_entropy(logits, labels)
+        loss = F.cross_entropy(logits, labels, label_smoothing=self.label_smoothing)
         with torch.no_grad():
             preds = logits.argmax(dim=1)
             accuracy = (preds == labels).float().mean().item()

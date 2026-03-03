@@ -31,10 +31,11 @@ class BasePretextTask(ABC, nn.Module):
         - forward(features, labels): loss + accuracy hesabı
     """
 
-    def __init__(self, feat_dim: int, hidden_dim: int = 256):
+    def __init__(self, feat_dim: int, hidden_dim: int = 256, label_smoothing: float = 0.15):
         super().__init__()
         self.feat_dim = feat_dim
         self.hidden_dim = hidden_dim
+        self.label_smoothing = label_smoothing
         self.head: nn.Module | None = None
 
     def _build_head(self) -> None:

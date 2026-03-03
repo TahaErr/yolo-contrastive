@@ -1,29 +1,21 @@
-"""FrequencyBandPrediction — Frekans bandi tahmin pretext taski.
+"""FrequencyBandPrediction v2 — 7 sinifli frekans bandi tahmin.
 
-Novel katki: Frekans domain pretext tasklar zaman serisi SSL'de
-kullanilmis (TF-C, TRLS, FreMixer) ancak goruntu SSL + object
-detection baglaminda hic denenmemis.
+v1'den farklar:
+    - 4 sinif → 7 sinif (single + dual-band masking)
+    - Label smoothing destegi (BasePretextTask'tan)
+    - Dual-band maskeleme pretrained backbone icin cok daha zor
 
-Motivasyon:
-    Object detection backbone'u 3 tur bilgi kullanir:
-    - Low frequency  -> genel sekil, kontur (shape)
-    - Mid frequency  -> doku, pattern (texture)
-    - High frequency -> kenar, ince detay (edge)
+7 sinif:
+    0: none      — orijinal (maskeleme yok)
+    1: low       — dusuk frekanslar silinir → sekil kaybi
+    2: mid       — orta frekanslar silinir → doku kaybi
+    3: high      — yuksek frekanslar silinir → kenar kaybi
+    4: low+mid   — sadece yuksek frekans kalir → sadece kenarlar
+    5: low+high  — sadece orta frekans kalir → sadece doku
+    6: mid+high  — sadece dusuk frekans kalir → sadece sekil
 
-Pipeline:
-    img -> FFT2D -> frekans maskesi uygula -> IFFT2D -> tahmin et
-
-    4 sinif:
-        0: none   - orijinal (maskeleme yok)
-        1: low    - dusuk frekanslar silinir (sekil kaybi)
-        2: mid    - orta frekanslar silinir (doku kaybi)
-        3: high   - yuksek frekanslar silinir (kenar kaybi)
-
-Referanslar:
-    - TF-C (Zhang et al. 2022): Time-frequency contrastive
-    - TRLS (2024): Spectrogram-based representation learning
-    - IE-Rot (Yamaguchi et al. 2019): Multi-task pretext
-    - Bu calisma: Frekans domain pretext -> goruntu SSL (ilk kez)
+Dual-band maskeleme tek bilgi ekseni birakir → backbone
+hangi eksenin kaldigini tanimlamak zorunda → cok zor.
 """
 
 from __future__ import annotations
@@ -38,29 +30,21 @@ from .base import BasePretextTask, register_task
 
 @register_task("freq_band")
 class FrequencyBandPrediction(BasePretextTask):
-    """Frekans bandi maskeleme tahmini.
+    """7 sinifli frekans bandi maskeleme tahmini."""
 
-    Goruntuye 2D FFT uygular, rastgele bir frekans bandini sifirlar,
-    IFFT ile geri donusturur. Model hangi bandin silindigini tahmin eder.
-
-    Siniflar:
-        0: none - orijinal goruntu
-        1: low  - dusuk frekanslar silinir (r < r_low)
-        2: mid  - orta frekanslar silinir (r_low < r < r_high)
-        3: high - yuksek frekanslar silinir (r > r_high)
-    """
-
-    BAND_NAMES = ["none", "low", "mid", "high"]
+    BAND_NAMES = ["none", "low", "mid", "high", "low+mid", "low+high", "mid+high"]
 
     def __init__(
         self,
         feat_dim: int,
         hidden_dim: int = 256,
+        label_smoothing: float = 0.15,
         low_ratio: float = 0.1,
         mid_ratio: float = 0.4,
         smooth_width: float = 0.02,
     ):
-        super().__init__(feat_dim=feat_dim, hidden_dim=hidden_dim)
+        super().__init__(feat_dim=feat_dim, hidden_dim=hidden_dim,
+                         label_smoothing=label_smoothing)
         self.low_ratio = low_ratio
         self.mid_ratio = mid_ratio
         self.smooth_width = smooth_width
@@ -73,14 +57,13 @@ class FrequencyBandPrediction(BasePretextTask):
 
     @property
     def num_classes(self) -> int:
-        return 4
+        return 7
 
     @property
     def difficulty(self) -> str:
         return "hard"
 
     def _get_distance_grid(self, H: int, W: int, device: torch.device) -> torch.Tensor:
-        """Frekans uzayinda merkeze normalize mesafe gridi."""
         key = (H, W, device)
         if key in self._mask_cache:
             return self._mask_cache[key]
@@ -96,39 +79,58 @@ class FrequencyBandPrediction(BasePretextTask):
             self._mask_cache[key] = dist
         return dist
 
-    def _make_band_mask(self, dist: torch.Tensor, band: int) -> torch.Tensor:
-        """Belirtilen frekans bandi icin maskeleme tensoru.
-
-        Mask = 1 -> korunur, Mask = 0 -> silinir.
-        Smooth sigmoid gecis (ringing artefaktlarini azaltir).
-        """
-        if band == 0:
-            return torch.ones_like(dist)
-
+    def _single_band_mask(self, dist: torch.Tensor, band: str) -> torch.Tensor:
+        """Tek band maskesi: low, mid veya high."""
         w = max(self.smooth_width, 1e-4)
 
-        if band == 1:
-            # Low: dusuk frekanslari sil (merkez)
+        if band == "low":
             return torch.sigmoid((dist - self.low_ratio) / w)
-
-        elif band == 2:
-            # Mid: orta frekanslari sil
+        elif band == "mid":
             keep_low = torch.sigmoid((self.low_ratio - dist) / w)
             keep_high = torch.sigmoid((dist - self.mid_ratio) / w)
             return (keep_low + keep_high).clamp(0.0, 1.0)
-
-        elif band == 3:
-            # High: yuksek frekanslari sil (kenarlar)
+        elif band == "high":
             return torch.sigmoid((self.mid_ratio - dist) / w)
+        return torch.ones_like(dist)
+
+    def _make_band_mask(self, dist: torch.Tensor, band_id: int) -> torch.Tensor:
+        """7 sinif icin maske olustur.
+
+        0: none      → full mask (hepsi korunur)
+        1: low       → low silinir
+        2: mid       → mid silinir
+        3: high      → high silinir
+        4: low+mid   → low VE mid silinir (sadece high kalir)
+        5: low+high  → low VE high silinir (sadece mid kalir)
+        6: mid+high  → mid VE high silinir (sadece low kalir)
+        """
+        if band_id == 0:
+            return torch.ones_like(dist)
+
+        if band_id <= 3:
+            # Single-band removal
+            names = ["low", "mid", "high"]
+            return self._single_band_mask(dist, names[band_id - 1])
+
+        # Dual-band removal: iki maskeyi carpariz
+        # (her iki bandin da silinmesi = iki maskenin minimum'u)
+        if band_id == 4:  # low+mid removed → only high remains
+            m_low = self._single_band_mask(dist, "low")
+            m_mid = self._single_band_mask(dist, "mid")
+            return (m_low * m_mid).clamp(0.0, 1.0)
+        elif band_id == 5:  # low+high removed → only mid remains
+            m_low = self._single_band_mask(dist, "low")
+            m_high = self._single_band_mask(dist, "high")
+            return (m_low * m_high).clamp(0.0, 1.0)
+        elif band_id == 6:  # mid+high removed → only low remains
+            m_mid = self._single_band_mask(dist, "mid")
+            m_high = self._single_band_mask(dist, "high")
+            return (m_mid * m_high).clamp(0.0, 1.0)
 
         return torch.ones_like(dist)
 
-    def _apply_freq_mask(self, img: torch.Tensor, band: int) -> torch.Tensor:
-        """Tek goruntuye frekans bandi maskeleme uygula.
-
-        Pipeline: img -> FFT2D -> shift -> mask -> ishift -> IFFT2D -> clamp
-        """
-        if band == 0:
+    def _apply_freq_mask(self, img: torch.Tensor, band_id: int) -> torch.Tensor:
+        if band_id == 0:
             return img
 
         C, H, W = img.shape
@@ -136,7 +138,7 @@ class FrequencyBandPrediction(BasePretextTask):
         freq_shifted = torch.fft.fftshift(freq, dim=(-2, -1))
 
         dist = self._get_distance_grid(H, W, img.device)
-        mask = self._make_band_mask(dist, band)
+        mask = self._make_band_mask(dist, band_id)
 
         freq_masked = freq_shifted * mask.unsqueeze(0)
         freq_unshifted = torch.fft.ifftshift(freq_masked, dim=(-2, -1))
@@ -145,17 +147,16 @@ class FrequencyBandPrediction(BasePretextTask):
         return img_back.real.clamp(0.0, 1.0)
 
     def transform(self, img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Batchteki her goruntuye rastgele frekans maskeleme uygula."""
         B = img.shape[0]
-        labels = torch.randint(0, 4, (B,), device=img.device)
+        labels = torch.randint(0, 7, (B,), device=img.device)
         out = img.clone()
 
-        for band in range(1, 4):
-            mask_idx = (labels == band).nonzero(as_tuple=True)[0]
+        for band_id in range(1, 7):
+            mask_idx = (labels == band_id).nonzero(as_tuple=True)[0]
             if len(mask_idx) == 0:
                 continue
             for i in mask_idx:
-                out[i] = self._apply_freq_mask(img[i], band)
+                out[i] = self._apply_freq_mask(img[i], band_id)
 
         return out, labels
 
@@ -163,7 +164,7 @@ class FrequencyBandPrediction(BasePretextTask):
         self, features: torch.Tensor, labels: torch.Tensor,
     ) -> Tuple[torch.Tensor, float]:
         logits = self.head(features)
-        loss = F.cross_entropy(logits, labels)
+        loss = F.cross_entropy(logits, labels, label_smoothing=self.label_smoothing)
         with torch.no_grad():
             preds = logits.argmax(dim=1)
             accuracy = (preds == labels).float().mean().item()
@@ -174,5 +175,6 @@ class FrequencyBandPrediction(BasePretextTask):
             f"FrequencyBandPrediction("
             f"classes={self.num_classes}, "
             f"low={self.low_ratio}, mid={self.mid_ratio}, "
+            f"ls={self.label_smoothing}, "
             f"feat_dim={self.feat_dim})"
         )
