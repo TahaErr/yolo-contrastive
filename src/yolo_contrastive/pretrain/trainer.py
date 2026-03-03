@@ -1,10 +1,15 @@
-"""SSLPretrainer — Backbone pretraining with unlabeled data."""
+"""SSLPretrainer — Backbone pretraining with unlabeled data.
+
+v2: CompositeTask support — multiple pretext tasks simultaneously.
+    Legacy RotationTask backward compat preserved.
+"""
 
 from __future__ import annotations
 
 import math
 import time
-from typing import Optional
+import warnings as _warnings
+from typing import List, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -14,12 +19,25 @@ from .backbone_utils import save_backbone
 
 
 class SSLPretrainer:
+    """Self-supervised pretrainer for YOLO backbone.
+
+    3 mod:
+        1) CompositeTask (yeni): pretext_tasks=["solarization","blur"], lambda_pretext=0.5
+        2) RotationTask (legacy): lambda_rot=0.5
+        3) Sadece CL: lambda_cl=1.0, pretext yok
+    """
+
     def __init__(
         self,
         model: str = "yolov8n.pt",
         aug_preset: str = "simclr_v2",
         lambda_cl: float = 1.0,
-        lambda_rot: float = 0.5,
+        # -- Composite pretext (yeni) --
+        pretext_tasks: Optional[List[str]] = None,
+        pretext_weights: Optional[List[float]] = None,
+        lambda_pretext: float = 0.0,
+        # -- Legacy rotation --
+        lambda_rot: float = 0.0,
         temperature: float = 0.2,
         proj_dim: int = 128,
         proj_hidden: int = 256,
@@ -29,8 +47,12 @@ class SSLPretrainer:
     ):
         self.imgsz = imgsz
         self.lambda_cl = lambda_cl
+        self.lambda_pretext = lambda_pretext
         self.lambda_rot = lambda_rot
+        self.pretext_task_names = pretext_tasks or []
+        self.pretext_weights = pretext_weights or []
 
+        # Device
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -39,6 +61,7 @@ class SSLPretrainer:
             else:
                 self.device = torch.device(device)
 
+        # YOLO model
         from ultralytics import YOLO
         yolo = YOLO(model)
         self.model = yolo.model.to(self.device)
@@ -48,14 +71,17 @@ class SSLPretrainer:
         trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
         print(f"[ycl] Model: {model} -> {self.device} ({trainable} trainable params)")
 
+        # Feature tap
         from ..feature_tap import FeatureTap
         self.feature_tap = FeatureTap(self.model, min_channels=128, store_grad=True)
         self.feature_tap.setup(device=self.device, imgsz=imgsz)
         print(f"[ycl] FeatureTap: {self.feature_tap.layer_name}")
 
+        # feat_dim
         self.feat_dim = self._detect_feat_dim()
         print(f"[ycl] Feature dim: {self.feat_dim}")
 
+        # Projection head
         from ..pretext.heads import ProjectionHead
         self.projection_head = ProjectionHead(
             feat_dim=self.feat_dim,
@@ -63,17 +89,35 @@ class SSLPretrainer:
             hidden_dim=proj_hidden,
         ).to(self.device)
 
+        # CL loss
         from ..contrastive.losses import build_contrastive_loss
         self.cl_loss_fn = build_contrastive_loss("ntxent", temperature=temperature)
 
+        # -- Pretext task --
+        self.pretext_task = None
         self.rot_task = None
-        if lambda_rot > 0:
+
+        if self.pretext_task_names and lambda_pretext > 0:
+            from ..pretext.composite import CompositeTask
+            if not self.pretext_weights:
+                self.pretext_weights = [1.0] * len(self.pretext_task_names)
+            self.pretext_task = CompositeTask.from_names(
+                names=self.pretext_task_names,
+                feat_dim=self.feat_dim,
+                hidden_dim=rot_hidden,
+                weights=self.pretext_weights,
+            ).to(self.device)
+            print(f"[ycl] Pretext: {self.pretext_task.log_summary()}")
+
+        elif lambda_rot > 0:
             from ..pretext.rotation import RotationTask
             self.rot_task = RotationTask(
                 feat_dim=self.feat_dim,
                 hidden_dim=rot_hidden,
             ).to(self.device)
+            print(f"[ycl] Rotation pretext (legacy): lambda_rot={lambda_rot}")
 
+        # Augmentation
         from ..augmentations.presets import build_pipeline
         self.augmentation = build_pipeline(aug_preset, imgsz=imgsz)
         print(f"[ycl] Augmentation: {aug_preset} ({len(self.augmentation)} ops)")
@@ -89,7 +133,6 @@ class SSLPretrainer:
             pass
 
     def _detect_feat_dim(self) -> int:
-        # FIX: BN running stats'ları koruyarak dummy forward yap
         from ..trainer._helpers import preserve_bn_running_stats
         self.model.eval()
         with torch.no_grad(), preserve_bn_running_stats(self.model):
@@ -108,6 +151,16 @@ class SSLPretrainer:
             raise RuntimeError("[ycl] FeatureTap returned None during training")
         return emb
 
+    @property
+    def _has_pretext(self) -> bool:
+        return self.pretext_task is not None or self.rot_task is not None
+
+    @property
+    def _pretext_lambda(self) -> float:
+        if self.pretext_task is not None:
+            return self.lambda_pretext
+        return self.lambda_rot
+
     def train(
         self,
         images_dir: str,
@@ -121,6 +174,7 @@ class SSLPretrainer:
         save_every: int = 25,
         print_every: int = 10,
     ) -> str:
+        """SSL pretraining on unlabeled images."""
         dataset = UnlabeledImageDataset(images_dir, imgsz=self.imgsz)
         dataloader = DataLoader(
             dataset, batch_size=batch_size, shuffle=True,
@@ -128,15 +182,19 @@ class SSLPretrainer:
         )
         print(f"[ycl] Dataset: {len(dataset)} images, {len(dataloader)} batches/epoch")
 
+        # Optimizer
         param_groups = [
             {"params": self.model.parameters(), "lr": lr},
             {"params": self.projection_head.parameters(), "lr": lr},
         ]
-        if self.rot_task is not None:
+        if self.pretext_task is not None:
+            param_groups.append({"params": self.pretext_task.parameters(), "lr": lr})
+        elif self.rot_task is not None:
             param_groups.append({"params": self.rot_task.parameters(), "lr": lr})
 
         optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
 
+        # LR scheduler
         total_steps = epochs * len(dataloader)
         warmup_steps = warmup_epochs * len(dataloader)
 
@@ -146,22 +204,27 @@ class SSLPretrainer:
             progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
             return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-        # FIX: LambdaLR.__init__ dahili step() çağırır → optimizer henüz step atmadığı
-        # için PyTorch uyarı verir. Uyarıyı init sırasında bastır, loop sırası doğrudur.
-        import warnings as _warnings
         with _warnings.catch_warnings():
             _warnings.simplefilter("ignore")
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+        # AMP
         use_amp = self.device.type == "cuda"
         try:
             scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         except TypeError:
             scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+        # Log
         print(f"\n[ycl] === SSL Pretraining Start ===")
         print(f"[ycl] epochs={epochs}, batch={batch_size}, lr={lr}")
-        print(f"[ycl] lambda_cl={self.lambda_cl}, lambda_rot={self.lambda_rot}")
+        print(f"[ycl] lambda_cl={self.lambda_cl}, lambda_pretext={self._pretext_lambda}")
+        if self.pretext_task:
+            print(f"[ycl] pretext: {self.pretext_task.log_summary()}")
+        elif self.rot_task:
+            print("[ycl] pretext: rotation (legacy)")
+        else:
+            print("[ycl] pretext: none")
         print(f"[ycl] output={output}\n")
 
         global_step = 0
@@ -171,14 +234,16 @@ class SSLPretrainer:
         try:
             for epoch in range(1, epochs + 1):
                 t0 = time.time()
-                epoch_cl_loss = 0.0
-                epoch_rot_loss = 0.0
-                epoch_rot_acc = 0.0
-                epoch_total = 0.0
+                ep_cl = 0.0
+                ep_pt = 0.0
+                ep_acc = 0.0
+                ep_total = 0.0
                 n_batches = 0
 
                 self.model.train()
                 self.projection_head.train()
+                if self.pretext_task:
+                    self.pretext_task.train()
                 if self.rot_task:
                     self.rot_task.train()
 
@@ -186,33 +251,42 @@ class SSLPretrainer:
                     imgs = imgs.to(self.device, non_blocking=True)
                     optimizer.zero_grad()
 
-                    # FIX: Augmentations OUTSIDE autocast and inside no_grad
+                    # Augmentations outside autocast
                     with torch.no_grad():
                         view1 = self.augmentation(imgs)
                         view2 = self.augmentation(imgs)
 
-                    rot_imgs = None
-                    rot_labels = None
-                    if self.rot_task is not None:
+                    # Pretext transform outside autocast
+                    pt_imgs = None
+                    pt_labels = None
+                    if self.pretext_task is not None:
                         with torch.no_grad():
-                            rot_imgs, rot_labels = self.rot_task.rotate_batch(imgs)
+                            pt_imgs, pt_labels = self.pretext_task.transform(imgs)
+                    elif self.rot_task is not None:
+                        with torch.no_grad():
+                            pt_imgs, pt_labels = self.rot_task.rotate_batch(imgs)
 
                     with torch.amp.autocast(self.device.type, enabled=use_amp):
+                        # CL views
                         z1 = self._get_embedding(view1)
                         p1 = self.projection_head(z1)
-
                         z2 = self._get_embedding(view2)
                         p2 = self.projection_head(z2)
-
                         cl_loss = self.cl_loss_fn(p1, p2)
 
-                        rot_loss = torch.tensor(0.0, device=self.device)
-                        rot_acc = 0.0
-                        if self.rot_task is not None and rot_imgs is not None:
-                            rot_features = self._get_embedding(rot_imgs)
-                            rot_loss, rot_acc = self.rot_task(rot_features, rot_labels)
+                        # Pretext
+                        pt_loss = torch.tensor(0.0, device=self.device)
+                        pt_acc = 0.0
 
-                        total = self.lambda_cl * cl_loss + self.lambda_rot * rot_loss
+                        if self.pretext_task is not None and pt_imgs is not None:
+                            pt_features = self._get_embedding(pt_imgs)
+                            pt_loss, pt_acc, _details = self.pretext_task(pt_features, pt_labels)
+
+                        elif self.rot_task is not None and pt_imgs is not None:
+                            pt_features = self._get_embedding(pt_imgs)
+                            pt_loss, pt_acc = self.rot_task(pt_features, pt_labels)
+
+                        total = self.lambda_cl * cl_loss + self._pretext_lambda * pt_loss
 
                     scaler.scale(total).backward()
                     scaler.step(optimizer)
@@ -223,50 +297,55 @@ class SSLPretrainer:
 
                     global_step += 1
                     n_batches += 1
-                    epoch_cl_loss += cl_loss.item()
-                    epoch_rot_loss += rot_loss.item()
-                    epoch_rot_acc += rot_acc
-                    epoch_total += total.item()
+                    ep_cl += cl_loss.item()
+                    ep_pt += pt_loss.item()
+                    ep_acc += pt_acc
+                    ep_total += total.item()
 
                     if print_every > 0 and global_step % print_every == 0:
                         lr_now = optimizer.param_groups[0]["lr"]
                         print(
                             f"  step={global_step:>5d} "
                             f"cl={cl_loss.item():.3f} "
-                            f"rot={rot_loss.item():.3f}(acc={rot_acc:.1%}) "
+                            f"pt={pt_loss.item():.3f}(acc={pt_acc:.1%}) "
                             f"total={total.item():.3f} "
                             f"lr={lr_now:.2e}"
                         )
 
+                # Epoch summary
                 n = max(1, n_batches)
-                avg_cl = epoch_cl_loss / n
-                avg_rot = epoch_rot_loss / n
-                avg_acc = epoch_rot_acc / n
-                avg_total = epoch_total / n
+                avg_cl = ep_cl / n
+                avg_pt = ep_pt / n
+                avg_acc = ep_acc / n
+                avg_total = ep_total / n
                 elapsed = time.time() - t0
 
                 print(
                     f"[ycl] Epoch {epoch:>3d}/{epochs} | "
-                    f"cl={avg_cl:.4f} rot={avg_rot:.4f}(acc={avg_acc:.1%}) "
+                    f"cl={avg_cl:.4f} pt={avg_pt:.4f}(acc={avg_acc:.1%}) "
                     f"total={avg_total:.4f} | {elapsed:.1f}s"
                 )
 
                 if save_every > 0 and epoch % save_every == 0:
                     ckpt = output.replace(".pt", f"_ep{epoch}.pt")
                     save_backbone(self.model, ckpt, epoch=epoch, extra={
-                        "cl_loss": avg_cl, "rot_loss": avg_rot, "rot_acc": avg_acc,
+                        "cl_loss": avg_cl, "pretext_loss": avg_pt, "pretext_acc": avg_acc,
+                        "pretext_tasks": self.pretext_task_names or ["rotation"],
                     })
                     print(f"[ycl] Checkpoint saved: {ckpt}")
 
                 if avg_total < best_loss:
                     best_loss = avg_total
 
+            # Final save
             total_time = time.time() - t0_total
+            task_list = self.pretext_task_names or (["rotation"] if self.rot_task else [])
             save_backbone(self.model, output, epoch=epochs, extra={
                 "total_time_sec": total_time,
                 "best_loss": best_loss,
                 "lambda_cl": self.lambda_cl,
-                "lambda_rot": self.lambda_rot,
+                "lambda_pretext": self._pretext_lambda,
+                "pretext_tasks": task_list,
             })
             print(f"\n[ycl] === SSL Pretraining Complete ===")
             print(f"[ycl] {epochs} epochs in {total_time/60:.1f} min")

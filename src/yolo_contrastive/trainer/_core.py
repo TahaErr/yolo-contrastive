@@ -194,7 +194,7 @@ class ContrastiveDetectionTrainer(
             f"pretext={pretext_str} "
             f"loss={cfg.loss_name} temp={cfg.temperature} "
             f"tap={self._feature_tap.layer_name} "
-            f"2v={cfg.two_view} preset={cfg.aug_preset or "legacy" }"
+            f"2v={cfg.two_view} preset={cfg.aug_preset or 'legacy'}"
         )
 
         self._install_model_patches()

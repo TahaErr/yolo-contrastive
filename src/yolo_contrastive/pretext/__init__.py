@@ -13,6 +13,7 @@ from .tasks import (
     PatchShuffleTask,
     BlurPredictionTask,
 )
+from .freq_band import FrequencyBandPrediction
 from .composite import CompositeTask
 from .heads import ProjectionHead, PredictionHead
 
@@ -21,6 +22,7 @@ __all__ = [
     "RotationTask",
     "SolarizationTask", "ColorPermutationTask",
     "PatchShuffleTask", "BlurPredictionTask",
+    "FrequencyBandPrediction",
     "CompositeTask",
     "ProjectionHead", "PredictionHead",
 ]
