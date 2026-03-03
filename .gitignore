@@ -50,3 +50,10 @@ runs/
 wandb/
 __pycache__/
 *.egg-info/
+
+# Downloaded datasets (exclude from repo)
+0-no-dcs-no-aug-*/
+
+# Downloaded datasets (exclude from repo)
+bdd100k-1/
+0-no-dcs-no-aug-6/
