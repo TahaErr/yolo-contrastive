@@ -48,5 +48,5 @@ class MultiLogger(BaseLogger):
             logger.finish()
 
     def __repr__(self) -> str:
-        names = [type(l).__name__ for l in self.loggers]
+        names = [type(lgr).__name__ for lgr in self.loggers]
         return f"MultiLogger({names})"

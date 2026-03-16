@@ -31,7 +31,7 @@ class CSVLogger(BaseLogger):
         self._buffer: Dict[str, float] = {}
 
     def log_scalar(self, key: str, value: float, step: Optional[int] = None) -> None:
-        s = self._resolve_step(step)
+        self._resolve_step(step)
         self._buffer[key] = value
 
     def log_scalars(self, metrics: Dict[str, float], step: Optional[int] = None) -> None:
