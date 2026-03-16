@@ -39,7 +39,7 @@ def byol(imgsz: int = 640) -> AugmentationPipeline:
     ])
 
 
-def aggressive() -> AugmentationPipeline:
+def aggressive(imgsz: int = 640) -> AugmentationPipeline:
     """Aggressive augmentation — for small datasets."""
     return AugmentationPipeline([
         RandomHorizontalFlip(p=0.5),
