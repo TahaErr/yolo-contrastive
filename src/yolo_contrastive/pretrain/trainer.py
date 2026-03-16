@@ -44,9 +44,18 @@ class SSLPretrainer:
         rot_hidden: int = 256,
         imgsz: int = 640,
         device: Optional[str] = None,
+        # -- Adapter (LoRA) --
+        adapter: Optional[str] = None,
+        adapter_rank: int = 4,
+        adapter_scale: float = 1.0,
+        adapter_dropout: float = 0.0,
     ):
         self.imgsz = imgsz
         self.lambda_cl = lambda_cl
+        self.adapter = adapter
+        self.adapter_rank = adapter_rank
+        self.adapter_scale = adapter_scale
+        self.adapter_dropout = adapter_dropout
         self.lambda_pretext = lambda_pretext
         self.lambda_rot = lambda_rot
         self.pretext_task_names = pretext_tasks or []
@@ -68,8 +77,27 @@ class SSLPretrainer:
         self.model.train()
         for param in self.model.parameters():
             param.requires_grad = True
-        trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
-        print(f"[ycl] Model: {model} -> {self.device} ({trainable} trainable params)")
+
+        # ── Adapter injection ──
+        self._adapter_info = None
+        if self.adapter is not None:
+            from ..adapters import inject_lora
+            self._adapter_info = inject_lora(
+                self.model,
+                rank=self.adapter_rank,
+                scale=self.adapter_scale,
+                dropout=self.adapter_dropout,
+                adapter_type=self.adapter,
+                verbose=True,
+            )
+            trainable = self._adapter_info["total_trainable"]
+            print(f"[ycl] Model: {model} -> {self.device} "
+                  f"(adapter={self.adapter}, rank={self.adapter_rank}, "
+                  f"trainable={trainable:,}, "
+                  f"frozen={self._adapter_info['frozen_params']:,})")
+        else:
+            trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
+            print(f"[ycl] Model: {model} -> {self.device} ({trainable} trainable params)")
 
         # Feature tap
         from ..feature_tap import FeatureTap
@@ -125,6 +153,14 @@ class SSLPretrainer:
     def cleanup(self):
         if hasattr(self, "feature_tap"):
             self.feature_tap.close()
+        # Adapter kaldır (merge edilmediyse)
+        if getattr(self, "_adapter_info", None) is not None:
+            try:
+                from ..adapters import remove_lora
+                remove_lora(self.model, merge=False, verbose=False)
+            except Exception:
+                pass
+            self._adapter_info = None
 
     def __del__(self):
         try:
@@ -183,10 +219,19 @@ class SSLPretrainer:
         print(f"[ycl] Dataset: {len(dataset)} images, {len(dataloader)} batches/epoch")
 
         # Optimizer
-        param_groups = [
-            {"params": self.model.parameters(), "lr": lr},
-            {"params": self.projection_head.parameters(), "lr": lr},
-        ]
+        if self._adapter_info is not None:
+            # Adapter modu: sadece trainable backbone params (LoRA + gate)
+            backbone_trainable = [p for p in self.model.parameters() if p.requires_grad]
+            param_groups = [
+                {"params": backbone_trainable, "lr": lr},
+                {"params": self.projection_head.parameters(), "lr": lr},
+            ]
+            print(f"[ycl] Optimizer: {len(backbone_trainable)} adapter params + heads")
+        else:
+            param_groups = [
+                {"params": self.model.parameters(), "lr": lr},
+                {"params": self.projection_head.parameters(), "lr": lr},
+            ]
         if self.pretext_task is not None:
             param_groups.append({"params": self.pretext_task.parameters(), "lr": lr})
         elif self.rot_task is not None:
