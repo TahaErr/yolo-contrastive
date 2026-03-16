@@ -142,6 +142,31 @@ class ContrastiveDetectionTrainer(
         )
         self._feature_tap.setup(device=device, imgsz=imgsz)
 
+        # ── Adapter (LoRA) injection ──
+        self._adapter_info_ct = None
+        self._task_router_ct = None
+
+        if cfg.adapter_enabled:
+            from ..adapters import inject_lora
+            _num_tasks = len(cfg.pretext_tasks) if cfg.pretext_tasks else 3
+            self._adapter_info_ct = inject_lora(
+                base_model,
+                rank=cfg.adapter_rank,
+                scale=cfg.adapter_scale,
+                adapter_type=cfg.adapter_type,
+                num_tasks=_num_tasks,
+                verbose=True,
+            )
+            log(f"[ycl] Adapter: {cfg.adapter_type} rank={cfg.adapter_rank} "
+                f"injected={self._adapter_info_ct['injected']} "
+                f"lora_params={self._adapter_info_ct['lora_params']:,}")
+            self._adapter_params_pending = True
+
+            if cfg.adapter_type == "task_routed":
+                from ..adapters import TaskRouter
+                self._task_router_ct = TaskRouter(base_model)
+                log(f"[ycl] TaskRouter: {self._task_router_ct.num_modules} modules")
+
         # ── Pretext task oluştur ──
         self._pretext_task = None
         self._rot_task = None  # backward compat
@@ -234,6 +259,22 @@ class ContrastiveDetectionTrainer(
                     )
                 self._pretext_params_pending = False
 
+            # Adapter params pending
+            if getattr(self, "_adapter_params_pending", False):
+                if self._adapter_info_ct is not None:
+                    adapter_params = [p for p in _unwrap_model(self.model).parameters()
+                                     if p.requires_grad and any(
+                                         kw in n for n, p2 in _unwrap_model(self.model).named_parameters()
+                                         if p2 is p
+                                         for kw in ("lora_", "gate", "mlp", "branches")
+                                     )]
+                    if adapter_params:
+                        _add_params_to_optimizer(
+                            opt, adapter_params,
+                            scheduler=sched, log_prefix="[ycl] adapter: "
+                        )
+                self._adapter_params_pending = False
+
         return batch
 
     # ── CL ──
@@ -252,6 +293,7 @@ class ContrastiveDetectionTrainer(
 
     def _compute_pretext(self, img, model_self, orig_forward):
         """CompositeTask veya legacy RotationTask ile pretext loss hesapla.
+        Task-routed modda her task için ayrı branch forward yapılır.
 
         Returns:
             Tuple[Optional[Tensor], float, str]:
@@ -356,6 +398,21 @@ class ContrastiveDetectionTrainer(
         ])
 
     def cleanup(self):
+        # Adapter merge
+        if getattr(self, "_adapter_info_ct", None) is not None:
+            try:
+                if getattr(self, "_task_router_ct", None) is not None:
+                    from ..adapters import merge_task_routed_model
+                    merge_task_routed_model(
+                        _unwrap_model(self.model), strategy="equal", verbose=True)
+                else:
+                    from ..adapters import remove_lora
+                    remove_lora(_unwrap_model(self.model), merge=True, verbose=True)
+            except Exception as e:
+                log(f"[ycl] WARN: adapter cleanup failed: {e}")
+            self._adapter_info_ct = None
+            self._task_router_ct = None
+
         self._uninstall_model_patches()
         if hasattr(self, "_feature_tap"):
             self._feature_tap.close()

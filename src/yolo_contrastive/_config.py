@@ -104,6 +104,11 @@ class CLConfig:
     lambda_rot: float = 0.0
     rot_hidden_dim: int = 256
 
+    # ── Adapter (LoRA) ──
+    adapter_type: str = ""
+    adapter_rank: int = 4
+    adapter_scale: float = 1.0
+
     # ── Legacy view2 augmentation params ──
     flip_p: float = 0.5
     gray_p: float = 0.2
@@ -123,6 +128,10 @@ class CLConfig:
     def pretext_enabled(self) -> bool:
         """Herhangi bir pretext task aktif mi?"""
         return self.lambda_pretext > 0 and len(self.pretext_tasks) > 0
+
+    @property
+    def adapter_enabled(self) -> bool:
+        return bool(self.adapter_type)
 
     @property
     def rotation_enabled(self) -> bool:
@@ -190,4 +199,9 @@ class CLConfig:
             contrast_hi=env_float("YCL_V2_CONT_HI", 1.4),
         )
         cfg.validate()
+        # Adapter
+        cfg.adapter_type = os.environ.get("YCL_ADAPTER", "")
+        cfg.adapter_rank = int(os.environ.get("YCL_ADAPTER_RANK", "4"))
+        cfg.adapter_scale = float(os.environ.get("YCL_ADAPTER_SCALE", "1.0"))
+
         return cfg
