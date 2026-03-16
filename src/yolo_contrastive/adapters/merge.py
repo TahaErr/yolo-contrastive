@@ -55,7 +55,7 @@ def compute_merge_alphas(
         # Inverse loss weighting: düşük loss → düşük ağırlık (zaten iyi)
         # Yüksek loss → yüksek ağırlık (daha fazla adaptasyon gerekli)
         losses = [max(task_losses.get(n, 1.0), 1e-6) for n in task_names]
-        inv = [1.0 / l for l in losses]
+        inv = [1.0 / loss_val for loss_val in losses]
         total = sum(inv)
         return [i / total for i in inv]
 
