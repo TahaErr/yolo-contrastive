@@ -11,12 +11,9 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-import torch
 import torch.nn as nn
 
 from .task_routed_lora import TaskRoutedConvLoRA
-from .freq_gated_lora import FreqGatedConvLoRA
-from .conv_lora import ConvLoRA
 
 
 def compute_merge_alphas(

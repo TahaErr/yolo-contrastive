@@ -52,6 +52,13 @@ def inject_lora(
             ).to(device)
             lora_params = adapter.num_trainable_params
             frozen_params = adapter.num_frozen_params
+        elif adapter_type == "task_routed":
+            adapter = TaskRoutedConvLoRA(
+                conv, num_tasks=num_tasks, rank=rank, scale=scale,
+                dropout=dropout, use_gate=use_gate, gate_hidden=gate_hidden,
+            ).to(device)
+            lora_params = adapter.num_trainable_params
+            frozen_params = adapter.num_frozen_params
         elif adapter_type == "plain":
             adapter = ConvLoRA(conv, rank=rank, scale=scale, dropout=dropout).to(device)
             lora_params = adapter.num_lora_params

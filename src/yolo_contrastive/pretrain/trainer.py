@@ -106,6 +106,14 @@ class SSLPretrainer:
                 self._task_router = TaskRouter(self.model)
                 print(f"[ycl] TaskRouter: {self._task_router.num_modules} modules, "
                       f"{self._task_router.num_tasks} tasks")
+
+            # TaskRouter (task_routed modunda)
+            self._task_router = None
+            if self.adapter == "task_routed":
+                from ..adapters import TaskRouter
+                self._task_router = TaskRouter(self.model)
+                print(f"[ycl] TaskRouter: {self._task_router.num_modules} modules, "
+                      f"{self._task_router.num_tasks} tasks")
         else:
             trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
             print(f"[ycl] Model: {model} -> {self.device} ({trainable} trainable params)")
@@ -164,6 +172,8 @@ class SSLPretrainer:
     def cleanup(self):
         if hasattr(self, "feature_tap"):
             self.feature_tap.close()
+        # Router temizle
+        self._task_router = None
         # Router temizle
         self._task_router = None
         # Adapter kaldır (merge edilmediyse)
@@ -413,6 +423,19 @@ class SSLPretrainer:
 
             # Final save
             total_time = time.time() - t0_total
+            # Adapter merge
+            if getattr(self, "_adapter_info", None) is not None:
+                if getattr(self, "_task_router", None) is not None:
+                    from ..adapters import merge_task_routed_model
+                    _n = merge_task_routed_model(self.model, strategy="equal", verbose=True)
+                    print(f"[ycl] Task-routed merged: {_n} adapters")
+                else:
+                    from ..adapters import remove_lora
+                    _n = remove_lora(self.model, merge=True, verbose=True)
+                    print(f"[ycl] Adapter merged: {_n} adapters")
+                self._adapter_info = None
+                self._task_router = None
+
             # Adapter merge
             if getattr(self, "_adapter_info", None) is not None:
                 if getattr(self, "_task_router", None) is not None:
