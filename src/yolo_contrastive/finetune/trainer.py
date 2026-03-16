@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import os
 
-import torch
-
 from ..pretrain.backbone_utils import load_backbone, unfreeze_all
 
 DetectionTrainer = None

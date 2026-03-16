@@ -261,7 +261,7 @@ class SSLPretrainer:
             scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         # Log
-        print(f"\n[ycl] === SSL Pretraining Start ===")
+        print("\n[ycl] === SSL Pretraining Start ===")
         print(f"[ycl] epochs={epochs}, batch={batch_size}, lr={lr}")
         print(f"[ycl] lambda_cl={self.lambda_cl}, lambda_pretext={self._pretext_lambda}")
         if self.pretext_task:
@@ -392,7 +392,7 @@ class SSLPretrainer:
                 "lambda_pretext": self._pretext_lambda,
                 "pretext_tasks": task_list,
             })
-            print(f"\n[ycl] === SSL Pretraining Complete ===")
+            print("\n[ycl] === SSL Pretraining Complete ===")
             print(f"[ycl] {epochs} epochs in {total_time/60:.1f} min")
             print(f"[ycl] Best loss: {best_loss:.4f}")
             print(f"[ycl] Backbone saved: {output}")

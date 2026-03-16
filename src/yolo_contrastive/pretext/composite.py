@@ -30,7 +30,7 @@ Kullanım:
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -199,7 +199,7 @@ class CompositeTask(nn.Module):
             lines.append(f"  {task.task_name}: {task.num_classes} classes, "
                          f"weight={w:.2f}, difficulty={task.difficulty}")
         return (
-            f"CompositeTask(\n"
+            "CompositeTask(\n"
             + "\n".join(lines)
             + f"\n  total: {self.total_classes} classes, {self.num_heads} heads)"
         )
