@@ -82,12 +82,15 @@ class SSLPretrainer:
         self._adapter_info = None
         if self.adapter is not None:
             from ..adapters import inject_lora
+            # task_routed için num_tasks = pretext task sayısı
+            _num_tasks = len(self.pretext_task_names) if self.pretext_task_names else 3
             self._adapter_info = inject_lora(
                 self.model,
                 rank=self.adapter_rank,
                 scale=self.adapter_scale,
                 dropout=self.adapter_dropout,
                 adapter_type=self.adapter,
+                num_tasks=_num_tasks,
                 verbose=True,
             )
             trainable = self._adapter_info["total_trainable"]
@@ -95,6 +98,14 @@ class SSLPretrainer:
                   f"(adapter={self.adapter}, rank={self.adapter_rank}, "
                   f"trainable={trainable:,}, "
                   f"frozen={self._adapter_info['frozen_params']:,})")
+
+            # TaskRouter (task_routed modunda)
+            self._task_router = None
+            if self.adapter == "task_routed":
+                from ..adapters import TaskRouter
+                self._task_router = TaskRouter(self.model)
+                print(f"[ycl] TaskRouter: {self._task_router.num_modules} modules, "
+                      f"{self._task_router.num_tasks} tasks")
         else:
             trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
             print(f"[ycl] Model: {model} -> {self.device} ({trainable} trainable params)")
@@ -153,6 +164,8 @@ class SSLPretrainer:
     def cleanup(self):
         if hasattr(self, "feature_tap"):
             self.feature_tap.close()
+        # Router temizle
+        self._task_router = None
         # Adapter kaldır (merge edilmediyse)
         if getattr(self, "_adapter_info", None) is not None:
             try:
@@ -324,8 +337,24 @@ class SSLPretrainer:
                         pt_acc = 0.0
 
                         if self.pretext_task is not None and pt_imgs is not None:
-                            pt_features = self._get_embedding(pt_imgs)
-                            pt_loss, pt_acc, _details = self.pretext_task(pt_features, pt_labels)
+                            if getattr(self, "_task_router", None) is not None:
+                                # Task-routed: her task için ayrı branch forward
+                                _pt_losses = []
+                                _pt_accs = []
+                                for _ti, _task in enumerate(self.pretext_task.tasks):
+                                    self._task_router.route(_ti)
+                                    _t_emb = self._get_embedding(pt_imgs)
+                                    _t_label = pt_labels[_task.task_name]
+                                    _t_loss, _t_acc = _task(_t_emb, _t_label)
+                                    _w = self.pretext_task.weights[_ti]
+                                    _pt_losses.append(_w * _t_loss)
+                                    _pt_accs.append(_t_acc)
+                                pt_loss = sum(_pt_losses)
+                                pt_acc = sum(_pt_accs) / len(_pt_accs)
+                                self._task_router.route(0)
+                            else:
+                                pt_features = self._get_embedding(pt_imgs)
+                                pt_loss, pt_acc, _details = self.pretext_task(pt_features, pt_labels)
 
                         elif self.rot_task is not None and pt_imgs is not None:
                             pt_features = self._get_embedding(pt_imgs)
@@ -384,6 +413,19 @@ class SSLPretrainer:
 
             # Final save
             total_time = time.time() - t0_total
+            # Adapter merge
+            if getattr(self, "_adapter_info", None) is not None:
+                if getattr(self, "_task_router", None) is not None:
+                    from ..adapters import merge_task_routed_model
+                    _n = merge_task_routed_model(self.model, strategy="equal", verbose=True)
+                    print(f"[ycl] Task-routed merged: {_n} adapters")
+                else:
+                    from ..adapters import remove_lora
+                    _n = remove_lora(self.model, merge=True, verbose=True)
+                    print(f"[ycl] Adapter merged: {_n} adapters")
+                self._adapter_info = None
+                self._task_router = None
+
             task_list = self.pretext_task_names or (["rotation"] if self.rot_task else [])
             save_backbone(self.model, output, epoch=epochs, extra={
                 "total_time_sec": total_time,

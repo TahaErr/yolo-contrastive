@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from .conv_lora import ConvLoRA
 from .freq_gated_lora import FreqGatedConvLoRA
+from .task_routed_lora import TaskRoutedConvLoRA
 
 
 def inject_lora(
@@ -19,6 +20,8 @@ def inject_lora(
     min_channels: int = 32,
     gate_hidden: int = 16,
     gate_init_bias: float = 1.0,
+    num_tasks: int = 3,
+    use_gate: bool = True,
     verbose: bool = True,
 ) -> Dict[str, int]:
     """YOLO backbone Conv2d katmanlarına LoRA adapter enjekte et."""
@@ -39,6 +42,13 @@ def inject_lora(
             adapter = FreqGatedConvLoRA(
                 conv, rank=rank, scale=scale, dropout=dropout,
                 gate_hidden=gate_hidden, gate_init_bias=gate_init_bias,
+            ).to(device)
+            lora_params = adapter.num_trainable_params
+            frozen_params = adapter.num_frozen_params
+        elif adapter_type == "task_routed":
+            adapter = TaskRoutedConvLoRA(
+                conv, num_tasks=num_tasks, rank=rank, scale=scale,
+                dropout=dropout, use_gate=use_gate, gate_hidden=gate_hidden,
             ).to(device)
             lora_params = adapter.num_trainable_params
             frozen_params = adapter.num_frozen_params
@@ -84,17 +94,17 @@ def remove_lora(model: nn.Module, merge: bool = True, verbose: bool = True) -> i
     # Tüm adapter'ları bul (sadece en dıştaki — iç içe ConvLoRA'yı atla)
     adapter_names = set()
     for name, module in list(model.named_modules()):
-        if isinstance(module, FreqGatedConvLoRA):
+        if isinstance(module, (FreqGatedConvLoRA, TaskRoutedConvLoRA)):
             adapter_names.add(name)
         elif isinstance(module, ConvLoRA):
-            # FreqGatedConvLoRA'nın içindeki ConvLoRA'yı atla
+            # FreqGatedConvLoRA/TaskRoutedConvLoRA'nın içindeki ConvLoRA'yı atla
             if any(name.startswith(p + ".") for p in adapter_names):
                 continue
             adapter_names.add(name)
 
     for name in adapter_names:
         module = dict(model.named_modules())[name]
-        if isinstance(module, (FreqGatedConvLoRA, ConvLoRA)):
+        if isinstance(module, (FreqGatedConvLoRA, TaskRoutedConvLoRA, ConvLoRA)):
             parts = name.rsplit(".", 1)
             if len(parts) == 2:
                 parent = dict(model.named_modules())[parts[0]]
@@ -106,7 +116,12 @@ def remove_lora(model: nn.Module, merge: bool = True, verbose: bool = True) -> i
             if merge:
                 new_conv = module.merge_weights()
             else:
-                new_conv = module.lora.conv if isinstance(module, FreqGatedConvLoRA) else module.conv
+                if isinstance(module, TaskRoutedConvLoRA):
+                    new_conv = module.conv
+                elif isinstance(module, FreqGatedConvLoRA):
+                    new_conv = module.lora.conv
+                else:
+                    new_conv = module.conv
                 for p in new_conv.parameters():
                     p.requires_grad = True
 
@@ -169,7 +184,7 @@ def _get_backbone_convs(model, backbone_layers, target_layers):
 
 def _freeze_backbone_non_lora(model, backbone_layers):
     """Backbone'daki LoRA olmayan parametreleri dondur."""
-    lora_keywords = {"lora_down", "lora_up", "lora_dropout", "gate", "mlp"}
+    lora_keywords = {"lora_down", "lora_up", "lora_dropout", "gate", "mlp", "branches"}
 
     for name, param in model.named_parameters():
         # LoRA/gate parametreleri → trainable
