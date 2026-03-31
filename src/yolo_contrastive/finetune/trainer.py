@@ -44,6 +44,7 @@ class FinetuneDetectionTrainer(DetectionTrainer):
             return
         n_loaded = load_backbone(self.model, pretrained_path, strict=False, verbose=True, backbone_only=True)
         _log(f"[ycl-ft] Loaded pretrained backbone: {pretrained_path} ({n_loaded} params)")
+
         self._ycl_freeze_layers = int(os.environ.get("YCL_FREEZE_BACKBONE", "10"))
         self._ycl_unfreeze_epoch = int(os.environ.get("YCL_UNFREEZE_EPOCH", "0"))
         self._ycl_backbone_lr_scale = float(os.environ.get("YCL_BACKBONE_LR_SCALE", "0.5"))
@@ -117,6 +118,20 @@ class FinetuneDetectionTrainer(DetectionTrainer):
 
         _log(f"[ycl-ft] Optimizer: {opt_cls.__name__} with differential LR")
         return optimizer
+
+    def _setup_train(self, world_size=1):
+        """EMA'yı SSL backbone ile senkronize et."""
+        super()._setup_train()
+        if getattr(self, "_ycl_has_pretrained", False) and hasattr(self, "ema") and self.ema is not None:
+            self.ema.ema.load_state_dict(self.model.state_dict())
+            self.ema.updates = 0
+            _log("[ycl-ft] EMA synced with SSL backbone")
+
+    def save_model(self):
+        """EMA'yı kaydetmeden önce gerçek modelle senkronize et."""
+        if hasattr(self, 'ema') and self.ema is not None:
+            self.ema.ema.load_state_dict(self.model.state_dict())
+        super().save_model()
 
     def preprocess_batch(self, batch):
         batch = super().preprocess_batch(batch)

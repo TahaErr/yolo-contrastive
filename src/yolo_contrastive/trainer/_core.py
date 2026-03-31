@@ -397,6 +397,17 @@ class ContrastiveDetectionTrainer(
             pretext_name,
         ])
 
+    def save_model(self):
+        """Override: EMA yerine gerçek modeli de kaydet."""
+        super().save_model()
+        import torch as _torch
+        if hasattr(self, "wdir") and self.wdir.exists():
+            real_path = self.wdir / "last_real.pt"
+            _torch.save({
+                "epoch": getattr(self, "epoch", 0),
+                "model_state_dict": _unwrap_model(self.model).state_dict(),
+            }, real_path)
+
     def cleanup(self):
         # Adapter merge
         if getattr(self, "_adapter_info_ct", None) is not None:
