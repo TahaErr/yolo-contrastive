@@ -11,6 +11,7 @@ from .spatial_aug import SpatialTwoViewAugmentation, TwoView
 from .dense_loss import dense_ntxent_loss, coords_to_feature_map
 from .multi_scale_loss import multi_scale_dense_loss
 from .projection import MultiScaleProjectionHead, infer_in_channels
+from .saps import saps_within_loss, saps_cross_loss
 
 __all__ = [
     "MultiScaleFeatureTap",
@@ -26,4 +27,6 @@ __all__ = [
     "multi_scale_dense_loss",
     "MultiScaleProjectionHead",
     "infer_in_channels",
+    "saps_within_loss",
+    "saps_cross_loss",
 ]

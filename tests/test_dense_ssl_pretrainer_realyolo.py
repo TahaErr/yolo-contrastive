@@ -244,3 +244,36 @@ class TestRealYOLOCheckpointInterop:
             assert n > 0, "no params loaded — incompatible checkpoint format"
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ── SAPS integration with real YOLO (Faz 2.3) ───────────────────────────
+
+
+class TestRealYOLOSAPS:
+    """Real YOLOv8 + SAPS: at least one mode runs end-to-end."""
+
+    def test_step_with_saps_both(self):
+        """saps_mode='both' on real YOLO — combined within+cross loss step."""
+        from yolo_contrastive.pretrain import DenseSSLPretrainer
+
+        tr = DenseSSLPretrainer(
+            model="yolov8n.pt",
+            out_dim=32, queue_size=32, n_query=8,
+            imgsz=64, device="cpu",
+            saps_mode="both", saps_t_scale=1.0,
+        )
+        try:
+            imgs = torch.rand(2, 3, 64, 64)
+            out = tr._step(imgs)
+            assert torch.isfinite(out["loss"]).item()
+            assert "within" in out["info"]
+            assert "cross" in out["info"]
+            # Verify queue tagging engaged
+            assert tr._needs_tagged_queues
+            for lv, q in tr.queues.items():
+                assert q.with_tags
+                # First step's enqueue should attach correct tags
+                tags = q.get_tags()
+                assert (tags == tr.level_to_id[lv]).all()
+        finally:
+            tr.cleanup()

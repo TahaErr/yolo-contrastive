@@ -475,3 +475,219 @@ class TestLoggerIntegration:
         finally:
             shutil.rmtree(tmp_imgs, ignore_errors=True)
             shutil.rmtree(tmp_out_dir, ignore_errors=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# SAPS integration tests (Faz 2.3)
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class TestSAPSConstruction:
+    def test_default_mode_is_none(self):
+        tr = _make_trainer()
+        try:
+            assert tr.saps_mode == "none"
+            assert tr._needs_tagged_queues is False
+            assert all(not q.with_tags for q in tr.queues.values())
+        finally:
+            tr.cleanup()
+
+    def test_invalid_mode_raises(self):
+        from yolo_contrastive.pretrain import DenseSSLPretrainer
+        encoder = _mock_yolo_encoder()
+        with pytest.raises(ValueError, match="saps_mode"):
+            DenseSSLPretrainer(model=encoder, saps_mode="bogus", device="cpu")
+
+    def test_invalid_t_scale_raises(self):
+        from yolo_contrastive.pretrain import DenseSSLPretrainer
+        encoder = _mock_yolo_encoder()
+        with pytest.raises(ValueError, match="saps_t_scale"):
+            DenseSSLPretrainer(model=encoder, saps_t_scale=0.0, device="cpu")
+        with pytest.raises(ValueError, match="saps_t_scale"):
+            DenseSSLPretrainer(model=encoder, saps_t_scale=-1.0, device="cpu")
+
+    def test_within_mode_state(self):
+        tr = _make_trainer(saps_mode="within")
+        try:
+            assert tr.saps_mode == "within"
+            assert tr._needs_tagged_queues is False
+            assert all(not q.with_tags for q in tr.queues.values())
+        finally:
+            tr.cleanup()
+
+    def test_cross_mode_state(self):
+        tr = _make_trainer(saps_mode="cross", saps_t_scale=0.5)
+        try:
+            assert tr.saps_mode == "cross"
+            assert tr.saps_t_scale == 0.5
+            assert tr._needs_tagged_queues is True
+            assert all(q.with_tags for q in tr.queues.values())
+        finally:
+            tr.cleanup()
+
+    def test_both_mode_state(self):
+        tr = _make_trainer(saps_mode="both")
+        try:
+            assert tr.saps_mode == "both"
+            assert tr._needs_tagged_queues is True
+            assert all(q.with_tags for q in tr.queues.values())
+        finally:
+            tr.cleanup()
+
+    def test_level_to_id_stable(self):
+        tr = _make_trainer()
+        try:
+            mapping = tr.level_to_id
+            assert mapping == {"P3": 0, "P4": 1, "P5": 2}
+        finally:
+            tr.cleanup()
+
+    def test_repr_includes_saps(self):
+        tr = _make_trainer(saps_mode="within")
+        try:
+            assert "saps=within" in repr(tr)
+        finally:
+            tr.cleanup()
+
+
+class TestSAPSStep:
+    """_step works in all 4 modes, each with finite loss & valid gradient."""
+
+    @pytest.mark.parametrize("mode", ["none", "within", "cross", "both"])
+    def test_step_runs(self, mode):
+        tr = _make_trainer(saps_mode=mode)
+        try:
+            imgs = torch.rand(2, 3, 64, 64)
+            out = tr._step(imgs)
+            assert torch.isfinite(out["loss"]).item()
+            assert out["batch_size"] == 2
+        finally:
+            tr.cleanup()
+
+    @pytest.mark.parametrize("mode", ["none", "within", "cross", "both"])
+    def test_grad_flows(self, mode):
+        tr = _make_trainer(saps_mode=mode)
+        try:
+            imgs = torch.rand(2, 3, 64, 64)
+            out = tr._step(imgs)
+            out["loss"].backward()
+            grads = [p.grad for p in tr.model.parameters() if p.grad is not None]
+            assert len(grads) > 0
+            assert any(g.abs().sum() > 0 for g in grads)
+        finally:
+            tr.cleanup()
+
+    def test_none_mode_info_flat(self):
+        tr = _make_trainer(saps_mode="none")
+        try:
+            out = tr._step(torch.rand(2, 3, 64, 64))
+            for lv in ("P3", "P4", "P5"):
+                assert lv in out["info"]
+                assert "acc_top1" in out["info"][lv]
+        finally:
+            tr.cleanup()
+
+    def test_within_mode_info_has_cross_scale_negs(self):
+        tr = _make_trainer(saps_mode="within")
+        try:
+            out = tr._step(torch.rand(2, 3, 64, 64))
+            assert "cross_scale_negs" in out["info"]["P3"]
+            assert out["info"]["P3"]["cross_scale_negs"] > 0
+        finally:
+            tr.cleanup()
+
+    def test_cross_mode_info_has_queue_neg_count(self):
+        """Empty queue first call → 0; after step, queue grows."""
+        tr = _make_trainer(saps_mode="cross")
+        try:
+            out1 = tr._step(torch.rand(2, 3, 64, 64))
+            assert out1["info"]["P3"]["queue_neg_count"] == 0
+            out2 = tr._step(torch.rand(2, 3, 64, 64))
+            # 3 levels × 2 batch = 6 entries combined after 1 enqueue
+            assert out2["info"]["P3"]["queue_neg_count"] == 6
+        finally:
+            tr.cleanup()
+
+    def test_both_mode_info_nested(self):
+        tr = _make_trainer(saps_mode="both")
+        try:
+            out = tr._step(torch.rand(2, 3, 64, 64))
+            assert "within" in out["info"]
+            assert "cross" in out["info"]
+            assert out["info"]["saps_mode"] == "both"
+            for lv in ("P3", "P4", "P5"):
+                assert lv in out["info"]["within"]
+                assert lv in out["info"]["cross"]
+        finally:
+            tr.cleanup()
+
+
+class TestSAPSQueueTagging:
+    @pytest.mark.parametrize("mode", ["cross", "both"])
+    def test_enqueue_attaches_correct_tags(self, mode):
+        tr = _make_trainer(saps_mode=mode)
+        try:
+            _ = tr._step(torch.rand(4, 3, 64, 64))
+            for lv, q in tr.queues.items():
+                tags = q.get_tags()
+                expected_id = tr.level_to_id[lv]
+                assert (tags == expected_id).all(), (
+                    f"Level {lv} expected tag {expected_id}, got {tags.tolist()}"
+                )
+        finally:
+            tr.cleanup()
+
+    def test_combined_queue_has_all_levels(self):
+        from yolo_contrastive.dense import combine_queues
+        tr = _make_trainer(saps_mode="cross")
+        try:
+            _ = tr._step(torch.rand(4, 3, 64, 64))
+            keys, tags = combine_queues(tr.queues, level_to_id=tr.level_to_id)
+            unique_tags = set(tags.unique().tolist())
+            assert unique_tags == {0, 1, 2}
+            # 4 batch × 3 levels = 12 total
+            assert keys.shape[0] == 12
+        finally:
+            tr.cleanup()
+
+
+class TestSAPSTrainSmoke:
+    @pytest.mark.parametrize("mode", ["none", "within", "cross", "both"])
+    def test_train_one_epoch(self, mode):
+        tmp_imgs = _dummy_images_dir(n=4, size=64)
+        tmp_out_dir = tempfile.mkdtemp(prefix=f"ycl_dense_saps_{mode}_")
+        try:
+            output = os.path.join(tmp_out_dir, "backbone.pt")
+            tr = _make_trainer(saps_mode=mode)
+            try:
+                tr.train(
+                    images_dir=tmp_imgs,
+                    epochs=1, batch_size=2, lr=1e-3,
+                    warmup_epochs=0, num_workers=0,
+                    output=output, save_every=0, print_every=1,
+                )
+            finally:
+                tr.cleanup()
+            assert os.path.exists(output)
+            ckpt = torch.load(output, map_location="cpu", weights_only=False)
+            assert "model_state_dict" in ckpt
+        finally:
+            shutil.rmtree(tmp_imgs, ignore_errors=True)
+            shutil.rmtree(tmp_out_dir, ignore_errors=True)
+
+
+class TestSAPSRegressionVsNone:
+    def test_none_mode_info_unchanged(self):
+        """saps_mode='none' must keep the pre-SAPS info schema (flat per-level)."""
+        tr = _make_trainer(saps_mode="none")
+        try:
+            out = tr._step(torch.rand(2, 3, 64, 64))
+            assert torch.isfinite(out["loss"]).item()
+            assert "total" in out["info"]
+            assert "P3" in out["info"]
+            assert "acc_top1" in out["info"]["P3"]
+            # No SAPS-specific structure
+            assert "within" not in out["info"]
+            assert "cross" not in out["info"]
+        finally:
+            tr.cleanup()

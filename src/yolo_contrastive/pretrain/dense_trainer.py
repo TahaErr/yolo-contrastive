@@ -47,6 +47,9 @@ from ..dense import (
     MultiScaleProjectionHead,
     multi_scale_dense_loss,
     infer_in_channels,
+    combine_queues,
+    saps_within_loss,
+    saps_cross_loss,
 )
 
 
@@ -89,6 +92,10 @@ class DenseSSLPretrainer:
         imgsz: int = 640,
         device: Optional[str] = None,
         logger: Any = None,
+        # ── SAPS (Faz 2.3) ──
+        saps_mode: str = "none",
+        saps_t_scale: float = 1.0,
+        saps_strict_negatives: bool = False,
     ) -> None:
         # ── basic validation ─────────────────────────────────────────────
         if out_dim <= 0:
@@ -110,6 +117,19 @@ class DenseSSLPretrainer:
         self.weights = dict(weights) if weights is not None else None
         self.imgsz = int(imgsz)
         self.logger = logger
+
+        # ── SAPS config ─────────────────────────────────────────────────
+        if saps_mode not in ("none", "within", "cross", "both"):
+            raise ValueError(
+                f"saps_mode must be 'none', 'within', 'cross', or 'both', "
+                f"got {saps_mode!r}"
+            )
+        if saps_t_scale <= 0:
+            raise ValueError(f"saps_t_scale must be positive, got {saps_t_scale}")
+        self.saps_mode = saps_mode
+        self.saps_t_scale = float(saps_t_scale)
+        self.saps_strict_negatives = bool(saps_strict_negatives)
+        self._needs_tagged_queues = saps_mode in ("cross", "both")
 
         # ── device ──────────────────────────────────────────────────────
         if device is None:
@@ -168,9 +188,20 @@ class DenseSSLPretrainer:
         self.proj_momentum.eval()
 
         # ── per-level queues ────────────────────────────────────────────
+        # When SAPS-cross or SAPS-both is active, we need scale tags on queue
+        # entries so combine_queues() can produce a tagged pool for the
+        # cross-image scale-aware reweighting.
         self.queues: Dict[str, FeatureQueue] = {
-            lv: FeatureQueue(dim=out_dim, K=queue_size).to(self.device)
+            lv: FeatureQueue(
+                dim=out_dim, K=queue_size,
+                with_tags=self._needs_tagged_queues,
+            ).to(self.device)
             for lv in in_channels
+        }
+        # Stable level → integer id mapping (P3=0, P4=1, P5=2 in default order).
+        # Used by SAPS-cross to broadcast scale-similarity weights.
+        self.level_to_id: Dict[str, int] = {
+            lv: i for i, lv in enumerate(in_channels.keys())
         }
 
         # ── augmentation ────────────────────────────────────────────────
@@ -231,13 +262,15 @@ class DenseSSLPretrainer:
             t = q.get()
             queue_tensors[lv] = t if t.shape[0] > 0 else None
 
-        # 5) Loss
-        loss, info = multi_scale_dense_loss(
+        # 5) Loss — branches on saps_mode
+        coords1 = views.coords1.to(self.device)
+        coords2 = views.coords2.to(self.device)
+
+        common_kwargs = dict(
             q_features=q_norm,
             k_features=k_norm,
-            q_coords=views.coords1.to(self.device),
-            k_coords=views.coords2.to(self.device),
-            queues=queue_tensors,
+            q_coords=coords1,
+            k_coords=coords2,
             weights=self.weights,
             temperature=self.temperature,
             n_query=self.n_query,
@@ -246,15 +279,66 @@ class DenseSSLPretrainer:
             return_info=True,
         )
 
+        if self.saps_mode == "none":
+            loss, info = multi_scale_dense_loss(
+                queues=queue_tensors, **common_kwargs,
+            )
+
+        elif self.saps_mode == "within":
+            loss, info = saps_within_loss(
+                queues=queue_tensors,
+                strict_negatives=self.saps_strict_negatives,
+                **common_kwargs,
+            )
+
+        elif self.saps_mode == "cross":
+            # Build a tagged combined queue from per-level tagged queues
+            keys, tags = combine_queues(self.queues, level_to_id=self.level_to_id)
+            loss, info = saps_cross_loss(
+                queue_keys=keys,
+                queue_tags=tags,
+                level_to_id=self.level_to_id,
+                t_scale=self.saps_t_scale,
+                **common_kwargs,
+            )
+
+        else:  # "both"
+            # Sum of within + cross — same numerator/denominator structure;
+            # raw addition keeps tests deterministic and avoids an extra
+            # hyperparameter. See WORK_PLAN_v4 §7 (open decisions).
+            loss_w, info_w = saps_within_loss(
+                queues=queue_tensors,
+                strict_negatives=self.saps_strict_negatives,
+                **common_kwargs,
+            )
+            keys, tags = combine_queues(self.queues, level_to_id=self.level_to_id)
+            loss_c, info_c = saps_cross_loss(
+                queue_keys=keys,
+                queue_tags=tags,
+                level_to_id=self.level_to_id,
+                t_scale=self.saps_t_scale,
+                **common_kwargs,
+            )
+            loss = loss_w + loss_c
+            info = {"within": info_w, "cross": info_c, "saps_mode": "both"}
+
         # 6) Enqueue keys for next step (one mean-pooled vector per (b, level))
         # Strategy: pool spatial dim, push [B, D] per level. Caller would
         # otherwise push HW vectors per sample, blowing through K instantly.
+        # When tagged, attach the level id so SAPS-cross can reweight by scale.
         with torch.no_grad():
             for lv, k_t in k_norm.items():
-                # k_t: [B, D, H, W] — pool to [B, D]
                 pooled = k_t.mean(dim=(2, 3))
                 pooled = F.normalize(pooled, dim=1)
-                self.queues[lv].enqueue(pooled)
+                if self._needs_tagged_queues:
+                    tag_value = self.level_to_id[lv]
+                    tags_b = torch.full(
+                        (pooled.shape[0],), tag_value,
+                        dtype=torch.long, device=pooled.device,
+                    )
+                    self.queues[lv].enqueue(pooled, tags=tags_b)
+                else:
+                    self.queues[lv].enqueue(pooled)
 
         return {"loss": loss, "info": info, "batch_size": B}
 
@@ -335,12 +419,19 @@ class DenseSSLPretrainer:
             scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         # ── log header ──────────────────────────────────────────────────
+        saps_line = (
+            f"[ycl-dense] saps={self.saps_mode}, "
+            f"t_scale={self.saps_t_scale}, "
+            f"strict_neg={self.saps_strict_negatives}\n"
+            if self.saps_mode != "none" else ""
+        )
         self._print(
             f"[ycl-dense] === Dense SSL Pretraining Start ===\n"
             f"[ycl-dense] epochs={epochs}, batch={batch_size}, lr={lr}\n"
             f"[ycl-dense] D={self.out_dim}, K={self.queue_size}, m={self.momentum_coef}\n"
             f"[ycl-dense] τ={self.temperature}, n_query={self.n_query}, "
             f"radius={self.pos_radius}, match={self.match_mode}\n"
+            + saps_line +
             f"[ycl-dense] dataset: {len(dataset)} imgs, {steps_per_epoch} batches/epoch\n"
             f"[ycl-dense] output: {output}\n"
         )
@@ -352,6 +443,9 @@ class DenseSSLPretrainer:
                     "momentum": self.momentum_coef, "temperature": self.temperature,
                     "n_query": self.n_query, "pos_radius": self.pos_radius,
                     "match_mode": self.match_mode,
+                    "saps_mode": self.saps_mode,
+                    "saps_t_scale": self.saps_t_scale,
+                    "saps_strict_negatives": self.saps_strict_negatives,
                 })
             except Exception:
                 pass
@@ -398,15 +492,21 @@ class DenseSSLPretrainer:
                     ep_loss += loss_v
                     n_batches += 1
 
-                    # Aggregate "total" stats from multi-scale info
-                    # (info["total"]["loss"] equals loss; per-level acc/pos/neg averaged)
+                    # Per-level info access depends on saps_mode:
+                    # - "none"/"within"/"cross" → info[level] = {acc_top1, ...}
+                    # - "both"                  → info["within"][level], info["cross"][level]
+                    # Use within's per-level stats as primary signal (it sees
+                    # the broadest negative pool); fall back to top-level dict.
+                    per_level_info = info.get("within", info)
+
                     accs, poss, negs = [], [], []
                     for lv in self._in_channels:
-                        if info.get(lv, {}).get("skipped"):
+                        lv_info = per_level_info.get(lv, {})
+                        if lv_info.get("skipped"):
                             continue
-                        accs.append(info[lv].get("acc_top1", 0.0))
-                        poss.append(info[lv].get("mean_pos_sim", 0.0))
-                        negs.append(info[lv].get("mean_neg_sim", 0.0))
+                        accs.append(lv_info.get("acc_top1", 0.0))
+                        poss.append(lv_info.get("mean_pos_sim", 0.0))
+                        negs.append(lv_info.get("mean_neg_sim", 0.0))
                     if accs:
                         ep_acc += sum(accs) / len(accs)
                         ep_pos += sum(poss) / len(poss)
@@ -482,5 +582,6 @@ class DenseSSLPretrainer:
         return (
             f"DenseSSLPretrainer(D={self.out_dim}, K={self.queue_size}, "
             f"m={self.momentum_coef}, τ={self.temperature}, "
-            f"levels={list(self._in_channels.keys())})"
+            f"levels={list(self._in_channels.keys())}, "
+            f"saps={self.saps_mode})"
         )
