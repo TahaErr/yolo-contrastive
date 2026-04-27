@@ -10,6 +10,7 @@ from .momentum_encoder import MomentumEncoder
 from .spatial_aug import SpatialTwoViewAugmentation, TwoView
 from .dense_loss import dense_ntxent_loss, coords_to_feature_map
 from .multi_scale_loss import multi_scale_dense_loss
+from .projection import MultiScaleProjectionHead, infer_in_channels
 
 __all__ = [
     "MultiScaleFeatureTap",
@@ -23,4 +24,6 @@ __all__ = [
     "dense_ntxent_loss",
     "coords_to_feature_map",
     "multi_scale_dense_loss",
+    "MultiScaleProjectionHead",
+    "infer_in_channels",
 ]
