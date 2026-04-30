@@ -350,8 +350,18 @@ class LinearProbeTrainer:
         lr: float = 1e-2,
         weight_decay: float = 0.0,
         verbose: bool = True,
+        early_stopping_patience: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Train the linear head; return best val_mAP and history.
+
+        Args:
+            train_loader, val_loader: DataLoaders.
+            epochs: max epoch count.
+            lr, weight_decay: AdamW hyperparameters for the head.
+            verbose: print per-epoch progress.
+            early_stopping_patience: if set, stop training when val_mAP has
+                not improved for this many consecutive epochs since the best
+                so far. None (default) → no early stopping (full epochs run).
 
         Returns:
             {
@@ -359,14 +369,24 @@ class LinearProbeTrainer:
               "best_epoch": int,
               "final_val_mAP": float,
               "history": [{"epoch":, "train_loss":, "val_mAP":}, ...],
+              "early_stopped": bool,        # True if stopped before `epochs`
+              "epochs_run": int,            # actual count of completed epochs
             }
         """
+        if early_stopping_patience is not None and early_stopping_patience < 1:
+            raise ValueError(
+                f"early_stopping_patience must be >= 1 or None, "
+                f"got {early_stopping_patience}"
+            )
+
         optimizer = torch.optim.AdamW(
             self.head.parameters(), lr=lr, weight_decay=weight_decay,
         )
         history: list = []
         best_map = -1.0
         best_epoch = 0
+        epochs_since_improvement = 0
+        early_stopped = False
         t0 = time.time()
 
         for epoch in range(1, epochs + 1):
@@ -379,20 +399,44 @@ class LinearProbeTrainer:
                 "val_mAP": val_map,
                 "n_valid_classes": val_metrics["n_valid_classes"],
             })
-            if val_map > best_map:
+            improved = val_map > best_map
+            if improved:
                 best_map = val_map
                 best_epoch = epoch
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
+
             if verbose:
+                stale = (
+                    f" stale={epochs_since_improvement}/{early_stopping_patience}"
+                    if early_stopping_patience is not None and not improved
+                    else ""
+                )
                 self._print(
                     f"[ycl-probe] epoch {epoch:3d}/{epochs} | "
-                    f"train_loss={train_loss:.4f} | val_mAP={val_map:.4f}"
+                    f"train_loss={train_loss:.4f} | val_mAP={val_map:.4f}{stale}"
                 )
 
+            if (
+                early_stopping_patience is not None
+                and epochs_since_improvement >= early_stopping_patience
+            ):
+                early_stopped = True
+                if verbose:
+                    self._print(
+                        f"[ycl-probe] early stop at epoch {epoch} "
+                        f"(no improvement for {epochs_since_improvement} epochs)"
+                    )
+                break
+
         elapsed = time.time() - t0
+        epochs_run = len(history)
         if verbose:
             self._print(
                 f"[ycl-probe] === Done in {elapsed:.1f}s | "
-                f"best mAP={best_map:.4f} @ epoch {best_epoch} ==="
+                f"best mAP={best_map:.4f} @ epoch {best_epoch}"
+                f"{' (early stopped)' if early_stopped else ''} ==="
             )
 
         return {
@@ -400,6 +444,8 @@ class LinearProbeTrainer:
             "best_epoch": best_epoch,
             "final_val_mAP": history[-1]["val_mAP"] if history else 0.0,
             "history": history,
+            "early_stopped": early_stopped,
+            "epochs_run": epochs_run,
         }
 
     # ── helpers ─────────────────────────────────────────────────────────

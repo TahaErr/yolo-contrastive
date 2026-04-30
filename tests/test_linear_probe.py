@@ -364,6 +364,75 @@ class TestTraining:
             probe.cleanup()
 
 
+class TestEarlyStopping:
+    """Optional early stopping by val_mAP plateau."""
+
+    def test_default_no_early_stop(self):
+        """patience=None (default) → all epochs run, fields present."""
+        probe = _make_probe(num_classes=3)
+        try:
+            ds = _RandomMultiLabelDataset(n=8, num_classes=3, imgsz=32, seed=0)
+            result = probe.fit(_loader(ds), _loader(ds),
+                                epochs=4, verbose=False)
+            assert result["epochs_run"] == 4
+            assert result["early_stopped"] is False
+            assert len(result["history"]) == 4
+        finally:
+            probe.cleanup()
+
+    def test_patience_triggers(self):
+        """If val_mAP plateaus for `patience` epochs, training stops early.
+
+        We use a deterministic-ish setup: small training dataset → mAP
+        likely plateaus quickly. With patience=1, any non-improving epoch
+        after the first triggers stop.
+        """
+        torch.manual_seed(0)
+        probe = _make_probe(num_classes=3)
+        try:
+            ds = _RandomMultiLabelDataset(n=12, num_classes=3, imgsz=32, seed=0)
+            # epochs=10 is the cap; we expect to stop well before
+            result = probe.fit(_loader(ds), _loader(ds),
+                                epochs=10, lr=1e-3, verbose=False,
+                                early_stopping_patience=1)
+            # Should not run all 10 epochs in plateau scenario
+            assert result["epochs_run"] < 10
+            # And early_stopped must be True
+            assert result["early_stopped"] is True
+            # best_epoch must be inside [1, epochs_run]
+            assert 1 <= result["best_epoch"] <= result["epochs_run"]
+        finally:
+            probe.cleanup()
+
+    def test_patience_huge_runs_full(self):
+        """If patience is larger than total epochs, behavior matches no-stop."""
+        probe = _make_probe(num_classes=3)
+        try:
+            ds = _RandomMultiLabelDataset(n=8, num_classes=3, imgsz=32, seed=0)
+            result = probe.fit(_loader(ds), _loader(ds),
+                                epochs=3, verbose=False,
+                                early_stopping_patience=100)
+            assert result["epochs_run"] == 3
+            assert result["early_stopped"] is False
+        finally:
+            probe.cleanup()
+
+    def test_invalid_patience_raises(self):
+        probe = _make_probe(num_classes=3)
+        try:
+            ds = _RandomMultiLabelDataset(n=4, num_classes=3, imgsz=32, seed=0)
+            with pytest.raises(ValueError, match="early_stopping_patience"):
+                probe.fit(_loader(ds), _loader(ds),
+                           epochs=2, verbose=False,
+                           early_stopping_patience=0)
+            with pytest.raises(ValueError, match="early_stopping_patience"):
+                probe.fit(_loader(ds), _loader(ds),
+                           epochs=2, verbose=False,
+                           early_stopping_patience=-1)
+        finally:
+            probe.cleanup()
+
+
 class TestLearningSignal:
     """The probe head should learn — given enough epochs on a learnable task,
     val_mAP should improve over training. We use a generous tolerance because
