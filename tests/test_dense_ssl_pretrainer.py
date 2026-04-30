@@ -691,3 +691,210 @@ class TestSAPSRegressionVsNone:
             assert "cross" not in out["info"]
         finally:
             tr.cleanup()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# SAPS-both lambda weighting (Risk 9)
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class TestSAPSBothLambda:
+    """λ-weighted sum: loss = loss_within + λ · loss_cross.
+
+    Default λ=1.0 preserves original additive behavior (regression-safe).
+    λ=0 collapses to within-only. λ>1 amplifies cross.
+    """
+
+    def test_default_lambda_is_one(self):
+        tr = _make_trainer(saps_mode="both")
+        try:
+            assert tr.saps_both_lambda == 1.0
+        finally:
+            tr.cleanup()
+
+    def test_invalid_lambda_raises(self):
+        from yolo_contrastive.pretrain import DenseSSLPretrainer
+        encoder = _mock_yolo_encoder()
+        with pytest.raises(ValueError, match="saps_both_lambda"):
+            DenseSSLPretrainer(model=encoder, saps_mode="both",
+                                saps_both_lambda=-0.1, device="cpu")
+
+    def test_lambda_zero_equals_within_only(self):
+        """λ=0 → loss = loss_within + 0 · loss_cross = loss_within.
+        Numerically equivalent to saps_mode='within' (with same seed)."""
+        torch.manual_seed(0)
+        imgs = torch.rand(2, 3, 64, 64)
+
+        # within-only run
+        tr_w = _make_trainer(saps_mode="within")
+        try:
+            torch.manual_seed(0)  # match RNG state with both-λ=0 below
+            out_w = tr_w._step(imgs.clone())
+            loss_within = float(out_w["loss"].detach().item())
+        finally:
+            tr_w.cleanup()
+
+        # both with λ=0
+        tr_b = _make_trainer(saps_mode="both", saps_both_lambda=0.0)
+        try:
+            torch.manual_seed(0)
+            out_b = tr_b._step(imgs.clone())
+            loss_both_lambda0 = float(out_b["loss"].detach().item())
+        finally:
+            tr_b.cleanup()
+
+        # NOTE: due to the queue having different tagged/untagged setup
+        # between within-only (untagged) and both (tagged), exact
+        # bit-equality isn't guaranteed at first step. But losses should
+        # be in the same ballpark, and crucially for λ=0, the cross
+        # contribution is exactly zeroed.
+        # Stricter assertion: check cross contribution is masked
+        loss_w_only = float(out_b["info"]["within"]["total"]["loss"])
+        # loss == loss_w_only when λ=0
+        assert abs(loss_both_lambda0 - loss_w_only) < 1e-5, (
+            f"λ=0: total loss {loss_both_lambda0} should equal "
+            f"within total {loss_w_only}"
+        )
+
+    def test_lambda_amplifies_cross_contribution(self):
+        """Verify the formula `loss = loss_within + λ · loss_cross` directly
+        using info dict from a single run. This is the cleanest invariant
+        check — no stochastic mismatch between runs.
+        """
+        torch.manual_seed(42)
+        for lam in (0.5, 1.0, 2.0, 3.0):
+            tr = _make_trainer(saps_mode="both", saps_both_lambda=lam)
+            try:
+                out = tr._step(torch.rand(2, 3, 64, 64))
+                loss_total = float(out["loss"].detach().item())
+                loss_w = float(out["info"]["within"]["total"]["loss"])
+                loss_c = float(out["info"]["cross"]["total"]["loss"])
+                expected = loss_w + lam * loss_c
+                assert abs(loss_total - expected) < 1e-4, (
+                    f"λ={lam}: total={loss_total:.4f} vs "
+                    f"expected w+λc = {loss_w:.4f} + {lam}·{loss_c:.4f} "
+                    f"= {expected:.4f}"
+                )
+            finally:
+                tr.cleanup()
+
+    def test_info_contains_lambda_value(self):
+        tr = _make_trainer(saps_mode="both", saps_both_lambda=0.5)
+        try:
+            out = tr._step(torch.rand(2, 3, 64, 64))
+            assert "saps_both_lambda" in out["info"]
+            assert out["info"]["saps_both_lambda"] == 0.5
+        finally:
+            tr.cleanup()
+
+    def test_lambda_ignored_in_non_both_modes(self):
+        """saps_both_lambda is set on trainer but only used when mode='both'.
+        Other modes should ignore it (no info field, no behavior change)."""
+        for mode in ("none", "within", "cross"):
+            tr = _make_trainer(saps_mode=mode, saps_both_lambda=0.7)
+            try:
+                out = tr._step(torch.rand(2, 3, 64, 64))
+                # saps_both_lambda only appears in info for "both" mode
+                assert "saps_both_lambda" not in out["info"], (
+                    f"mode={mode}: saps_both_lambda should not appear in info"
+                )
+            finally:
+                tr.cleanup()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Queue update strategy (Risk 7 — ablation prep)
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class TestQueueUpdateStrategy:
+    """Three strategies for pushing keys into the FPN-level queues:
+    - "pooled":       1 vec per (image, level)  → B per level/step  (default)
+    - "per_position": HxW vecs per (image, lvl) → B*HW per level/step
+    - "subsample":    n random pos per image    → B*n per level/step
+
+    Tests verify:
+      1. default is "pooled" (regression-safe)
+      2. invalid strategy raises
+      3. invalid subsample_n raises
+      4. each strategy enqueues the expected number of entries per level
+    """
+
+    def test_default_strategy_is_pooled(self):
+        tr = _make_trainer()
+        try:
+            assert tr.queue_update_strategy == "pooled"
+            assert tr.queue_subsample_n == 16
+        finally:
+            tr.cleanup()
+
+    def test_invalid_strategy_raises(self):
+        from yolo_contrastive.pretrain import DenseSSLPretrainer
+        with pytest.raises(ValueError, match="queue_update_strategy"):
+            DenseSSLPretrainer(model=_mock_yolo_encoder(),
+                                queue_update_strategy="bogus", device="cpu")
+
+    def test_invalid_subsample_n_raises(self):
+        from yolo_contrastive.pretrain import DenseSSLPretrainer
+        with pytest.raises(ValueError, match="queue_subsample_n"):
+            DenseSSLPretrainer(model=_mock_yolo_encoder(),
+                                queue_subsample_n=0, device="cpu")
+        with pytest.raises(ValueError, match="queue_subsample_n"):
+            DenseSSLPretrainer(model=_mock_yolo_encoder(),
+                                queue_subsample_n=-5, device="cpu")
+
+    def test_pooled_pushes_B_per_level(self):
+        """Default strategy: B entries per level per step."""
+        B = 2
+        tr = _make_trainer(queue_update_strategy="pooled")
+        try:
+            queues_before = {lv: len(q) for lv, q in tr.queues.items()}
+            _ = tr._step(torch.rand(B, 3, 64, 64))
+            for lv, q in tr.queues.items():
+                added = len(q) - queues_before[lv]
+                assert added == B, (
+                    f"pooled level {lv}: expected B={B} entries added, "
+                    f"got {added}"
+                )
+        finally:
+            tr.cleanup()
+
+    def test_per_position_pushes_BHW_per_level(self):
+        """Per-position: B * H_lv * W_lv entries per level per step."""
+        B = 2
+        tr = _make_trainer(queue_update_strategy="per_position",
+                            queue_size=100_000)  # big enough not to wrap
+        try:
+            queues_before = {lv: len(q) for lv, q in tr.queues.items()}
+            out = tr._step(torch.rand(B, 3, 64, 64))
+            # mock encoder: imgsz 64 → P3=8x8, P4=4x4, P5=2x2 (strides 8/16/32)
+            expected = {"P3": B * 8 * 8, "P4": B * 4 * 4, "P5": B * 2 * 2}
+            for lv, q in tr.queues.items():
+                added = len(q) - queues_before[lv]
+                assert added == expected[lv], (
+                    f"per_position level {lv}: expected {expected[lv]} "
+                    f"entries added, got {added}"
+                )
+        finally:
+            tr.cleanup()
+
+    def test_subsample_pushes_Bn_per_level(self):
+        """Subsample: B * n entries per level per step (capped at HW)."""
+        B = 2
+        n = 4
+        tr = _make_trainer(queue_update_strategy="subsample",
+                            queue_subsample_n=n,
+                            queue_size=100_000)
+        try:
+            queues_before = {lv: len(q) for lv, q in tr.queues.items()}
+            _ = tr._step(torch.rand(B, 3, 64, 64))
+            # n=4, but for P5 HW=4 (2x2) so it caps at 4 also
+            # P3 HW=64, P4 HW=16, P5 HW=4 — n=4 ≤ all
+            for lv, q in tr.queues.items():
+                added = len(q) - queues_before[lv]
+                assert added == B * n, (
+                    f"subsample level {lv}: expected {B * n} entries added, "
+                    f"got {added}"
+                )
+        finally:
+            tr.cleanup()

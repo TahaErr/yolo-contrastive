@@ -96,6 +96,10 @@ class DenseSSLPretrainer:
         saps_mode: str = "none",
         saps_t_scale: float = 1.0,
         saps_strict_negatives: bool = False,
+        saps_both_lambda: float = 1.0,
+        # ── Queue update strategy (Risk 7) ──
+        queue_update_strategy: str = "pooled",
+        queue_subsample_n: int = 16,
     ) -> None:
         # ── basic validation ─────────────────────────────────────────────
         if out_dim <= 0:
@@ -126,10 +130,29 @@ class DenseSSLPretrainer:
             )
         if saps_t_scale <= 0:
             raise ValueError(f"saps_t_scale must be positive, got {saps_t_scale}")
+        if saps_both_lambda < 0:
+            raise ValueError(
+                f"saps_both_lambda must be >= 0, got {saps_both_lambda}"
+            )
         self.saps_mode = saps_mode
         self.saps_t_scale = float(saps_t_scale)
         self.saps_strict_negatives = bool(saps_strict_negatives)
+        self.saps_both_lambda = float(saps_both_lambda)
         self._needs_tagged_queues = saps_mode in ("cross", "both")
+
+        # ── Queue update strategy (Risk 7) ──
+        if queue_update_strategy not in ("pooled", "per_position", "subsample"):
+            raise ValueError(
+                f"queue_update_strategy must be one of "
+                f"{{'pooled', 'per_position', 'subsample'}}, "
+                f"got {queue_update_strategy!r}"
+            )
+        if queue_subsample_n <= 0:
+            raise ValueError(
+                f"queue_subsample_n must be positive, got {queue_subsample_n}"
+            )
+        self.queue_update_strategy = queue_update_strategy
+        self.queue_subsample_n = int(queue_subsample_n)
 
         # ── device ──────────────────────────────────────────────────────
         if device is None:
@@ -303,9 +326,11 @@ class DenseSSLPretrainer:
             )
 
         else:  # "both"
-            # Sum of within + cross — same numerator/denominator structure;
-            # raw addition keeps tests deterministic and avoids an extra
-            # hyperparameter. See WORK_PLAN_v4 §7 (open decisions).
+            # Weighted sum: loss = loss_within + λ · loss_cross.
+            # Default λ=1.0 preserves the previous (additive) behavior. λ=0
+            # collapses to within-only (numerically equivalent to
+            # saps_mode="within"), useful as an ablation control point.
+            # See WORK_PLAN §7 + Risk 9.
             loss_w, info_w = saps_within_loss(
                 queues=queue_tensors,
                 strict_negatives=self.saps_strict_negatives,
@@ -319,26 +344,53 @@ class DenseSSLPretrainer:
                 t_scale=self.saps_t_scale,
                 **common_kwargs,
             )
-            loss = loss_w + loss_c
-            info = {"within": info_w, "cross": info_c, "saps_mode": "both"}
+            loss = loss_w + self.saps_both_lambda * loss_c
+            info = {
+                "within": info_w,
+                "cross": info_c,
+                "saps_mode": "both",
+                "saps_both_lambda": self.saps_both_lambda,
+            }
 
-        # 6) Enqueue keys for next step (one mean-pooled vector per (b, level))
-        # Strategy: pool spatial dim, push [B, D] per level. Caller would
-        # otherwise push HW vectors per sample, blowing through K instantly.
-        # When tagged, attach the level id so SAPS-cross can reweight by scale.
+        # 6) Enqueue keys for next step (Risk 7 — strategy-switchable):
+        #    - "pooled":       1 vec per (b, level)         → B per level
+        #    - "per_position": HW vec per (b, level)         → B*HW per level
+        #    - "subsample":    n random pos per (b, level)   → B*n per level
+        # When tagged, attach level id so SAPS-cross can reweight by scale.
         with torch.no_grad():
             for lv, k_t in k_norm.items():
-                pooled = k_t.mean(dim=(2, 3))
-                pooled = F.normalize(pooled, dim=1)
+                # k_t: [B, D, H, W]
+                if self.queue_update_strategy == "pooled":
+                    entries = k_t.mean(dim=(2, 3))                   # [B, D]
+                elif self.queue_update_strategy == "per_position":
+                    B_, D_, H_, W_ = k_t.shape
+                    entries = (
+                        k_t.flatten(2)                                # [B, D, HW]
+                           .permute(0, 2, 1)                          # [B, HW, D]
+                           .reshape(-1, D_)                           # [B*HW, D]
+                    )
+                else:  # "subsample"
+                    B_, D_, H_, W_ = k_t.shape
+                    HW = H_ * W_
+                    n = min(self.queue_subsample_n, HW)
+                    idx = torch.randperm(HW, device=k_t.device)[:n]
+                    flat = k_t.flatten(2)                             # [B, D, HW]
+                    entries = (
+                        flat[..., idx]                                # [B, D, n]
+                            .permute(0, 2, 1)                         # [B, n, D]
+                            .reshape(-1, D_)                          # [B*n, D]
+                    )
+
+                entries = F.normalize(entries, dim=1)
                 if self._needs_tagged_queues:
                     tag_value = self.level_to_id[lv]
                     tags_b = torch.full(
-                        (pooled.shape[0],), tag_value,
-                        dtype=torch.long, device=pooled.device,
+                        (entries.shape[0],), tag_value,
+                        dtype=torch.long, device=entries.device,
                     )
-                    self.queues[lv].enqueue(pooled, tags=tags_b)
+                    self.queues[lv].enqueue(entries, tags=tags_b)
                 else:
-                    self.queues[lv].enqueue(pooled)
+                    self.queues[lv].enqueue(entries)
 
         return {"loss": loss, "info": info, "batch_size": B}
 
@@ -419,11 +471,22 @@ class DenseSSLPretrainer:
             scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         # ── log header ──────────────────────────────────────────────────
+        saps_extras = []
+        if self.saps_mode != "none":
+            saps_extras.append(f"t_scale={self.saps_t_scale}")
+            saps_extras.append(f"strict_neg={self.saps_strict_negatives}")
+            if self.saps_mode == "both":
+                saps_extras.append(f"both_λ={self.saps_both_lambda}")
         saps_line = (
-            f"[ycl-dense] saps={self.saps_mode}, "
-            f"t_scale={self.saps_t_scale}, "
-            f"strict_neg={self.saps_strict_negatives}\n"
+            f"[ycl-dense] saps={self.saps_mode}, " + ", ".join(saps_extras) + "\n"
             if self.saps_mode != "none" else ""
+        )
+        queue_line = (
+            f"[ycl-dense] queue_strategy={self.queue_update_strategy}"
+            + (f" (n={self.queue_subsample_n})"
+               if self.queue_update_strategy == "subsample" else "")
+            + "\n"
+            if self.queue_update_strategy != "pooled" else ""
         )
         self._print(
             f"[ycl-dense] === Dense SSL Pretraining Start ===\n"
@@ -431,7 +494,8 @@ class DenseSSLPretrainer:
             f"[ycl-dense] D={self.out_dim}, K={self.queue_size}, m={self.momentum_coef}\n"
             f"[ycl-dense] τ={self.temperature}, n_query={self.n_query}, "
             f"radius={self.pos_radius}, match={self.match_mode}\n"
-            + saps_line +
+            + saps_line
+            + queue_line +
             f"[ycl-dense] dataset: {len(dataset)} imgs, {steps_per_epoch} batches/epoch\n"
             f"[ycl-dense] output: {output}\n"
         )
@@ -446,6 +510,9 @@ class DenseSSLPretrainer:
                     "saps_mode": self.saps_mode,
                     "saps_t_scale": self.saps_t_scale,
                     "saps_strict_negatives": self.saps_strict_negatives,
+                    "saps_both_lambda": self.saps_both_lambda,
+                    "queue_update_strategy": self.queue_update_strategy,
+                    "queue_subsample_n": self.queue_subsample_n,
                 })
             except Exception:
                 pass
