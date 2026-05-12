@@ -1,0 +1,71 @@
+# =============================================================================
+# Stage 1 — Smoke ablation (pipeline + mode×queue minimal interaction)
+# =============================================================================
+# Purpose:
+#   Validate end-to-end pretrain pipeline on the SAPS-mode × queue-strategy
+#   axes that constitute the paper's main hypothesis. Smoke-grade pool & epoch
+#   count — results here are NOT paper data, they signal "code works + the
+#   axes do something measurable".
+#
+# Grid:
+#   saps_mode             ∈ {none, within, both}        (3 values; cross dropped
+#                                                        as it's a subset of both)
+#   queue_update_strategy ∈ {pooled, per_position}       (2 values; subsample
+#                                                        is a hybrid, tested in
+#                                                        Stage 2)
+#   λ, t_scale, seed:     fixed (defaults)
+#
+# Expansion: 3 × 2 = 6 cells × 1 seed = 6 runs.
+# Estimated cost: ~10 min/cell on A100 (5K pool, 30 epoch, imgsz=320) ≈ 1 hour.
+#
+# Success criteria (qualitative — these are smoke, not paper):
+#   - All 6 cells complete (status='ok' in CSV) — no crashes
+#   - acc@1 > 0.5 by epoch 30 — backbones learning
+#   - Final losses ordered consistently across modes — the axes are doing
+#     something measurable
+#
+# If any cell crashes: stop, fix; advance to Stage 2 only on clean smoke.
+# =============================================================================
+
+task: pretrain
+output_csv: /content/runs/ablation_stage1/results.csv
+
+base:
+  # ── Data ──────────────────────────────────────────────────────────────
+  images_dir: /content/datasets/bdd100k_ssl_5k
+
+  # ── Model (DenseSSLPretrainer constructor kwargs) ─────────────────────
+  model: yolov8n.pt
+  imgsz: 320
+  out_dim: 128
+  queue_size: 4096
+  momentum: 0.99
+  temperature: 0.2
+  n_query: 128
+  pos_radius: 0.07
+  match_mode: threshold
+  device: cuda
+
+  # SAPS fixed defaults (overridden per-cell only for axes in `grid` below)
+  saps_both_lambda: 1.0
+  saps_t_scale: 1.0
+  queue_subsample_n: 16
+
+  # ── Training (DenseSSLPretrainer.train kwargs) ────────────────────────
+  epochs: 30
+  batch_size: 32
+  lr: 1.0e-3
+  warmup_epochs: 2
+  num_workers: 4
+  print_every: 100
+  output_dir: /content/runs/ablation_stage1
+
+# ── Varying axes ────────────────────────────────────────────────────────
+grid:
+  saps_mode: [none, within, both]
+  queue_update_strategy: [pooled, per_position]
+
+seeds: [42]
+
+# ── Exclusions (none for Stage 1 — full small grid) ─────────────────────
+exclude: []

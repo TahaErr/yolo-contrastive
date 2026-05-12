@@ -1,0 +1,73 @@
+# =============================================================================
+# Stage 2 — Coarse ablation (full mode × queue interaction, paper-preliminary)
+# =============================================================================
+# Purpose:
+#   Establish paper-grade preliminary numbers for the main hypothesis axes:
+#   SAPS mode and queue update strategy. Medium pool & longer epoch budget
+#   sufficient for reliable mode comparison. Results from this stage become
+#   the basis for Stage 3 fine-grid (best mode/queue selected here).
+#
+# Grid:
+#   saps_mode             ∈ {none, within, cross, both}      (full)
+#   queue_update_strategy ∈ {pooled, per_position, subsample} (full)
+#   λ, t_scale, seed:     fixed (defaults — Stage 3 tunes these)
+#
+# Expansion: 4 × 3 = 12 cells × 1 seed = 12 runs.
+# Estimated cost: ~3-5 hr/cell on A100 (50K pool, 50 epoch, imgsz=640) ≈ 50 hr.
+#
+# Prerequisite — 50K BDD subset:
+#   /content/datasets/bdd100k_ssl_50k must exist. Built deterministically:
+#     random.seed(42); subset = random.sample(bdd100k_full, 50000)
+#   This subset must be re-used across all 12 cells so the comparison is
+#   apples-to-apples. Stage 1 used a different (5K) subset — don't mix.
+#
+# Selection criterion for Stage 3:
+#   The (mode, queue) pair with highest mean acc@1 over the last 5 epochs.
+#   Ties broken by lower final loss. If saps_mode != 'both' wins, Stage 3
+#   λ and t_scale axes auto-collapse via §10.24a exclude DSL (most λ/t_scale
+#   values are redundant when mode lacks the relevant loss term).
+# =============================================================================
+
+task: pretrain
+output_csv: /content/runs/ablation_stage2/results.csv
+
+base:
+  # ── Data ──────────────────────────────────────────────────────────────
+  images_dir: /content/datasets/bdd100k_ssl_50k
+
+  # ── Model ─────────────────────────────────────────────────────────────
+  model: yolov8n.pt
+  imgsz: 640                       # ↑ from 320 — Stage 1 was smoke
+  out_dim: 128
+  queue_size: 65536                # ↑ from 4096 — paper-typical for 50K pool
+  momentum: 0.999                  # ↑ from 0.99 — slower EMA for stable comparison
+  temperature: 0.2
+  n_query: 128
+  pos_radius: 0.07
+  match_mode: threshold
+  device: cuda
+
+  saps_both_lambda: 1.0
+  saps_t_scale: 1.0
+  queue_subsample_n: 16
+
+  # ── Training ──────────────────────────────────────────────────────────
+  epochs: 50
+  batch_size: 64
+  lr: 1.0e-3
+  warmup_epochs: 5
+  num_workers: 8
+  print_every: 200
+  output_dir: /content/runs/ablation_stage2
+
+grid:
+  saps_mode: [none, within, cross, both]
+  queue_update_strategy: [pooled, per_position, subsample]
+
+seeds: [42]
+
+# ── Exclusions ──────────────────────────────────────────────────────────
+# Stage 2 fixes λ and t_scale at their defaults across all cells. The §10.24a
+# DSL collapses below kick in only when those axes vary (Stage 3). No
+# exclusions needed at this stage.
+exclude: []

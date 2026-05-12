@@ -404,6 +404,8 @@ v2 invariants (3 regression test ile guard'lı):
 > Generalize: bir fix'in unit test'i bug pattern'ını reprodüce ediyor olabilir, ama **fix'in yan etkilerini production-equivalent flow'da test etmeden** deploy etmek tehlikeli. Bizim case'de Risk 16 reprodüksiyonu izole bir minimal example (target taint + load_state_dict çağrısı) idi; **production'da bu çağrı bir Ultralytics ModelEMA update zincirinin içinde**, ve aliasing exploit edilebilir hâle geldi.
 
 Future work: bu pattern'ı bir general principle olarak codify et — fix'lerin "post-fix invariant tests" (sadece original bug değil, fix'in yan etkileri) **production-representative integration test** ile validate edilmeli.
+
+**Production validation closure (2026-05-12):** v2 fix Colab A100 üzerinde 12-epoch SSL + 12-epoch finetune E2E koşulunda doğrulandı. Head norm 4.438 (baseline 3.5), cls_loss 1.252 (baseline 1.05), mAP50 0.5465 (baseline 0.6266) — tam metrikler §11.8'de. Bu run hem v2 fix'in çalıştığının canlı kanıtı, hem de Faz 5 ablation matrix'ine geçiş için "pipeline-yeşil" damgası.
 ---
 
 ## 11. Architecture Sentinels
@@ -426,6 +428,28 @@ Faz 5 detection finetune'unda bu rakamlardan **belirgin sapma** (örn. COCO mAP5
 
 **Pattern observation:** SSL pretrained backbone'ları COCO'dan precision higher / recall lower üretiyor (konservatif). Eğer Faz 5'te aynı pattern devam ederse "SSL produces more discriminative low-recall features" gözlemi paper'a girer.
 
+### 11.8 Risk 16 v2 fix production validation (Faz 5 readiness — yeni)
+
+v2 fix'in (§10.25) gerçek koşullar altında doğrulandığı smoke run. Roboflow 4-class infrastructure dataset (3371 train / 548 val), 12-epoch SSL pretrain (5K BDD subset) + 12-epoch detection finetune, imgsz=320, batch=32, freeze=10, unfreeze@5, A100-40GB:
+
+```python
+{
+    # Same dataset/config, three different SSL trainer states:
+    "coco_baseline":     {"mAP50": 0.6266, "mAP50_95": 0.3676,
+                          "head_norm": 3.5,     "cls_loss_final": 1.05},
+    "v1_aliased":        {"mAP50": 0.0000, "mAP50_95": 0.0000,
+                          "head_norm": 0.00,    "cls_loss_final": 19480,
+                          "note": "§10.25 EMA aliasing collapse — head→0"},
+    "v2_ssl_both":       {"mAP50": 0.5465, "mAP50_95": 0.2832,
+                          "head_norm": 4.438,   "cls_loss_final": 1.252,
+                          "note": "v2 fix production-validated"},
+}
+```
+
+**Pattern observation (v1 → v2):** Aynı dataset + config + epoch budget altında, v1 (aliased EMA) tüm metriklere "0" sonucunu verir; v2 (taint cleanup + plain load) baseline'la **aynı mertebede** sonuç verir (mAP50 farkı 0.08, cls_loss farkı %20). Bu fark **SSL'in henüz mAP'i geçemediğinin** göstergesi (5K image + 12 epoch yetersiz), **fix'in çalışmadığının değil**. SSL'in baseline'ı geçmesi için Faz 5 §5 madde 6 gerekir (full 186K pool, 100 epoch).
+
+**Faz 5 readiness sentinel:** İleride yeni bir EMA-touching kod değişikliği yapıldıktan sonra, yukarıdaki üç metrik (mAP50, head_norm, cls_loss_final) ${\pm 20\%}$ aralıkta yeniden üretilebilmeli. Aksi takdirde regression var demektir — sandbox forensics (tests/test_finetune_risk16.py I3 invariant) ek olarak fail edebilir.
+
 ---
 
 ## 12. Şu Anki Durum
@@ -444,6 +468,8 @@ Kanıtlar:
 - (Sonra, kullanıcı kararıyla) Faz 5 prep ya da Faz 3 reactivate
 
 **Faz 5 öncesi yapılacaklar:**
-- ✅ Risk 16 kalıcı fix (assign=True, §10.23)
+- ✅ Risk 16 kalıcı fix v2 (taint cleanup + plain load, §10.25, production-validated §11.8)
 - ✅ SSL pretrain pool — 181,446 image (§2.1)
+- ✅ Ablation grid YAML'ları — 3 stage (smoke/coarse/fine), §4 + configs/pretrain/
 - Pothole 5K dataset (kullanıcı paralel)
+- Compute platform kararı: Stage 2+3 için vast.ai vs Colab Pro+
