@@ -80,6 +80,7 @@ src/yolo_contrastive/
   pretrain/
     trainer.py                   ✓ (mevcut SSLPretrainer korunuyor)
     dense_trainer.py             ✓ 48 test (ön: 36 + λ: 6 + queue strat: 6)
+    run_matrix.py                ✓ 34 test (PretrainMatrix — YAML-driven ablation orchestrator, eval/run_matrix sister; list-DSL exclude — §10.24)
 
   finetune/
     trainer.py                   ✓ (Yol 3 smoke ile validated, Risk 16 var)
@@ -304,6 +305,47 @@ Bu mode'da loader hedef tensor'ları **reference assignment** ile değiştirir (
 Bu sınırlama `_safe_ema_sync` docstring'inde açıkça belgelenir; helper'ın başka yerde gözü kapalı reuse edilmesi engellenir.
 
 **Why §10.22's suggestion seemed plausible:** `clone + no_grad` deseni *farklı* bir PyTorch 2.x sorununu çözer — InferenceMode tensor'larından **gradient hesaplama** girişimleri. Risk 16 bu değil; Risk 16 InferenceMode tensor'larına **inplace yazma** girişimleridir. Çözümler orthogonal.
+
+### 10.24 PretrainMatrix design — academic ablation orchestrator (yeni)
+
+Plan §5'in dört eksenli ablation grid'i (~192 cell) manuel orkestrasyon dışında. `eval/run_matrix.py` benzer iş yapıyor ama sabit (methods/datasets/fractions/seeds) eksen seti ve downstream eval için. Pretrain ablation'ı **parametrik** — ekseni YAML belirler. `pretrain/run_matrix.py` aynı resume/error/CSV iskeletini taşır; iki noktada akademik tercih yapıldı.
+
+**10.24a — Exclude DSL: scalar OR list değer.**
+Pretrain ablation'da yaygın pattern: bir eksen, diğer ekseninin spesifik değerinde redundant olur. Kanonik vaka: `saps_both_lambda` sadece `saps_mode=both` iken anlamlı — diğer mode'larda kod yolu λ'yi okumaz, dolayısıyla 4 farklı λ değeri aynı sonucu üretir.
+
+Seçenek (a) — smart default: `auto_exclude_lambda: true` flag, kod içinde hard-coded collapse. Reddedildi:
+- Hidden behavior: YAML okuyan biri kod açmadan ablation setini göremez
+- Brittle: yeni interaction çıkarsa (örn. `queue_subsample_n` ↔ `queue_strategy`) yeniden kod
+- Paper supplementary'de exclude listesi manuel enumerate gerekir
+
+Seçenek (b — seçilen) — generic list-DSL: exclude entry'lerinde scalar yerine list de kabul (`in` semantics):
+```yaml
+exclude:
+  - saps_mode: [none, within, cross]
+    saps_both_lambda: [0.5, 1.0, 2.0]
+```
+- Explicit: paper supplementary'de birebir alıntılanır, kod yorumu gereksiz
+- Reusable: aynı pattern başka eksen interaction'larında değişiklik yapılmadan çalışır
+- Auditable: tüm exclude kuralları YAML'ın kendi içinde listelenir
+- Minimal kod farkı: `isinstance(allowed, list)` branch'i — ~5 satır
+
+Test taxonomy (8 test): scalar match, list match, AND combine (tek entry içi), multi-entry OR, list+scalar mix, seed özel anahtar, **bilinmeyen axis defensive no-match** (typo'lar cell drop etmesin), no-exclude baseline.
+
+**10.24b — CSV schema: `axes_json` kolonu.**
+Eval matrix CSV'si fixed kolonlu (`method, dataset, fraction, seed, ...`). Pretrain ablation YAML'dan YAML'a farklı eksen varyer. İki seçenek:
+
+- Dinamik header (her YAML için eksen adlarıyla genişler): manuel inceleme okunaklı, ama cross-run merge zorlaşır, pandas analysis fragile, CSV resume kolon adı varsayımı yapamaz
+- Deterministik şema + JSON kolonu (seçilen): `cell_id, seed, axes_json, metric, ...` sabit; eksen bilgisi `axes_json` içinde
+
+Pandas-side analiz tek pattern:
+```python
+df = pd.read_csv("results.csv")
+df_axes = df["axes_json"].apply(json.loads).apply(pd.Series)
+df = pd.concat([df.drop(columns=["axes_json"]), df_axes], axis=1)
+```
+Şema deterministik, merge basit, paper figure pipeline'ı YAML'dan bağımsız.
+
+**Cell ID:** `sha1(json.dumps({axes, seed}, sort_keys=True))[:12]`. Backbone filename + CSV resume key. Deterministik (aynı config → aynı id), çakışmaz (~192 cell'de Birthday < 10⁻⁸), readable (12 hex char), no UUID dependency.
 ---
 
 ## 11. Architecture Sentinels
