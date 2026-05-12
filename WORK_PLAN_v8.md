@@ -141,7 +141,7 @@ Bekleyen kararlar: backbone (YOLO-native vs ViT) + scope (full vs essential).
 2. Class distribution analizi (Risk 11 — atlanmıştı, gerek olunca)
 3. Leakage check (Faz 4.2)
 4. Pothole 5K split
-5. **Risk 16 kalıcı fix** (PT 2.x crash, RunMatrix detection runner için zorunlu)
+5. ✅ **Risk 16 kalıcı fix** (commit pending — `assign=True` fix uygulandı, §10.23)
 6. SSL pretrain — Ours full A+D (~186K, 100 epoch)
 7. SSL pretrain — Ours ablations (saps_mode × saps_both_lambda × queue_strategy × t_scale)
 8. (Faz 3 reactive ise) MoCo-v3 + DINOv2
@@ -169,7 +169,7 @@ Bekleyen kararlar: backbone (YOLO-native vs ViT) + scope (full vs essential).
 | 13 | Roboflow `..` path | ✅ unified_loader fallback |
 | 14 | Eval dataset değişimi | data.yaml swap hazır |
 | 15 | SSL'in COCO'yu geçememesi | Faz 4.7 + Yol 3 smoke ölçeğinde GÖZLENDİ. Faz 5'te ~186K + cross-domain ile test edilecek. **Eğer Faz 5'te de geçmezse hipotez sallantıda — fallback domain-specific hikaye.** |
-| **16** | **PyTorch 2.x InferenceMode crash post-train** (yeni) | **WORKAROUND aktif:** try/except + CSV fallback. Kalıcı fix: `finetune/trainer.py::save_model` ve `_setup_train`'deki `load_state_dict` çağrılarına `torch.no_grad()` veya `.clone()` patch. **Faz 5 RunMatrix detection runner için zorunlu.** |
+| **16** | **PyTorch 2.x InferenceMode crash post-train** | ✅ ÇÖZÜLDÜ — `_safe_ema_sync` helper'ında `load_state_dict(state, assign=True)`. Sandbox forensics ile §10.22'nin önerdiği fix'in yetersiz olduğu kanıtlandı, gerçek çözüm §10.23'te. Regression: `tests/test_finetune_risk16.py` (3 test). |
 
 ---
 
@@ -180,7 +180,6 @@ Bekleyen kararlar: backbone (YOLO-native vs ViT) + scope (full vs essential).
 - Multi-scale loss weights — başlangıç 1/3
 - ~~SAPS-both α~~ → ✅ `saps_both_lambda` parametresi (Risk 9 kapatıldı, Faz 5 ablation: {0, 0.5, 1.0, 2.0})
 - ~~Queue update stratejisi~~ → ✅ `queue_update_strategy` parametresi (Risk 7 kapatıldı, Faz 5 ablation: {pooled, per_position, subsample})
-- Risk 16 kalıcı fix tasarımı — Faz 5 öncesi
 - Faz 3 reaktivasyon — kullanıcı kararı
 
 ---
@@ -206,7 +205,7 @@ Bekleyen kararlar: backbone (YOLO-native vs ViT) + scope (full vs essential).
 | 3-5 | Faz 2 | ✅ |
 | 5-6 | Faz 4 + smokes | ✅ (Faz 4.7 + Yol 3) |
 | 6-7 | Risk 7, 9 closure (ablation prep) | ✅ |
-| 7-9 | SSL veri indirme + Risk 16 kalıcı fix | 🟡 paralel + ⬜ |
+| 7-9 | SSL veri indirme + Risk 16 kalıcı fix | ✅ + ✅ |
 | 9-11 | Faz 5 pretrain compute | ⬜ |
 | 11-12 | Faz 5 eval + analiz | ⬜ |
 | ?-? | Faz 3 (opsiyonel) | ⏸ |
@@ -261,6 +260,50 @@ Faz 5 ablation'da hangi strategy'nin SAPS ile en iyi çalıştığı ölçülece
 
 **Neden hemen düzeltmedik:** Smoke amacımız mAP raporu almaktı (alındı). Fix Ultralytics versiyonuna spesifik, 3 run test gerek, ayrı bir commit hak ediyor. Faz 5 RunMatrix detection runner yazılırken zorunlu olacak.
 
+**FIX UPDATE (uygulandı):** Yukarıda önerilen `clone + with torch.no_grad()` yaklaşımı sandbox reprodüksiyonunda **crash'i çözmedi**. Sebep: taint *target* tensor'larında, source'da değil — source'u clone etmek hedef tensor'un InferenceMode bayrağını etkilemez. Doğru çözüm `load_state_dict(state, assign=True)`; detaylı analiz §10.23'te. Implementation: `FinetuneDetectionTrainer._safe_ema_sync`. Test: `tests/test_finetune_risk16.py` (bug-reproducing + fix-validating + code sentinel).
+
+
+### 10.23 Risk 16 fix re-design — `assign=True` is the actual solution (yeni)
+
+§10.22'de önerilen "source state clone + `with torch.no_grad()`" yaklaşımı sandbox reprodüksiyonunda **crash'i çözmedi**. İzole forensics minimal reproducer ile bug pattern'ını ve fix kandidatlarını test etti; sonuçlar burada belgelenir.
+
+**Crash mekanizması — kesin sebep:**
+1. Ultralytics' internal validator forward'ı `torch.inference_mode()` altında koşar
+2. Bu pass sırasında oluşan tensor'lar (özellikle BN buffer ataması yapılırsa) InferenceMode bayrağı taşır
+3. EMA copy (`self.ema.ema`) bir noktada bu tainted buffer'ları içerir
+4. `self.ema.ema.load_state_dict(self.model.state_dict())` hedef tensor'lara **in-place** yazar
+5. InferenceMode bayraklı tensor'a InferenceMode bağlamı dışında inplace yazma yasak → `RuntimeError`
+
+**Tainted-tensor taxonomy (her kategori tek başına yeterli):**
+| Tainted kategori | Plain `load_state_dict` | `assign=True` |
+|---|---|---|
+| `running_mean` (BN buffer, float) | CRASH | OK |
+| `running_var` (BN buffer, float) | CRASH | OK |
+| `num_batches_tracked` (BN buffer, int) | CRASH | OK |
+| Conv/Linear weight (param) | CRASH | OK |
+| BN scale/bias (param) | CRASH | OK |
+
+Crash buffer-vs-param ayrımı değil; **hedef tensor'un bayrağı**.
+
+**Neden source clone başarısız:** `clone()` yeni temiz tensor üretir (`is_inference()=False`), ancak `load_state_dict` bu temiz source'u tainted target'a in-place kopyalar. İhlal kopyalama yönünden bağımsız — destination tensor'a yazılması yeterli.
+
+**Doğru çözüm — `load_state_dict(state, assign=True)` (PyTorch 2.1+):**
+Bu mode'da loader hedef tensor'ları **reference assignment** ile değiştirir (in-place mutate etmez). Eski tainted tensor'lar drop edilir, yenisi (source'tan gelen, temiz) konur. InferenceMode bayrağı yeni tensor'da yok.
+
+**Post-fix invariants (sandbox forensics ile doğrulanmış):**
+- ✓ Parametreler source'a tam transfer
+- ✓ Hiçbir InferenceMode bayrağı target'ta kalmaz
+- ✓ Forward pass çalışır, sonlu çıktı üretir
+- ✓ Tüm parametreler hâlâ leaf tensor (gradient flow korunur)
+
+**Kritik caveat — `assign=True` ve optimizer state:**
+`assign=True` parametre objesinin **iç tensor referansını** değiştirir; eğer hedef modülün üzerinde aktif bir optimizer varsa, optimizer `param_groups`'ta eski tensor referanslarını tutar. Yani:
+- ✓ **EMA için güvenli** (`self.ema.ema` üzerinde optimizer yok)
+- ✗ **Optimizer altındaki bir modül için kullanırsanız optimizer state geçersiz olur** — caller sonradan `optimizer = type(opt)(model.parameters(), ...)` ile yeniden kurmalı
+
+Bu sınırlama `_safe_ema_sync` docstring'inde açıkça belgelenir; helper'ın başka yerde gözü kapalı reuse edilmesi engellenir.
+
+**Why §10.22's suggestion seemed plausible:** `clone + no_grad` deseni *farklı* bir PyTorch 2.x sorununu çözer — InferenceMode tensor'larından **gradient hesaplama** girişimleri. Risk 16 bu değil; Risk 16 InferenceMode tensor'larına **inplace yazma** girişimleridir. Çözümler orthogonal.
 ---
 
 ## 11. Architecture Sentinels
@@ -301,6 +344,6 @@ Kanıtlar:
 - (Sonra, kullanıcı kararıyla) Faz 5 prep ya da Faz 3 reactivate
 
 **Faz 5 öncesi yapılacaklar:**
-- Risk 16 kalıcı fix (PT 2.x crash patch)
-- SSL pretrain pool indirme (kullanıcı paralel)
+- ✅ Risk 16 kalıcı fix (assign=True, §10.23)
+- ✅ SSL pretrain pool — 181,446 image (§2.1)
 - Pothole 5K dataset (kullanıcı paralel)

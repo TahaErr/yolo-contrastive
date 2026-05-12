@@ -119,18 +119,44 @@ class FinetuneDetectionTrainer(DetectionTrainer):
         _log(f"[ycl-ft] Optimizer: {opt_cls.__name__} with differential LR")
         return optimizer
 
+    def _safe_ema_sync(self) -> None:
+        """Sync EMA weights to current model state, robust to InferenceMode taint.
+
+        Background (Risk 16, WORK_PLAN §10.22 + §10.23):
+            Ultralytics' internal validator runs forward passes under
+            ``torch.inference_mode()``. After such a pass, parameters or
+            buffers on the EMA copy can carry the InferenceMode flag. A
+            subsequent plain ``load_state_dict(state)`` then tries to
+            update those tensors in-place and raises::
+
+                RuntimeError: Inplace update to inference tensor outside
+                              InferenceMode is not allowed.
+
+        Fix: ``assign=True`` (PyTorch 2.1+). Destination tensors are
+        replaced by reference rather than mutated in-place; the old
+        tainted tensors are dropped and the freshly assigned ones inherit
+        no InferenceMode flag.
+
+        Limitation: ``assign=True`` invalidates any optimizer that holds
+        references to the previous parameter tensors. Safe for
+        ``self.ema.ema`` because EMA has no associated optimizer. Do NOT
+        reuse this helper on a module under active optimization without
+        rebuilding the optimizer afterwards.
+        """
+        self.ema.ema.load_state_dict(self.model.state_dict(), assign=True)
+
     def _setup_train(self, world_size=1):
         """EMA'yı SSL backbone ile senkronize et."""
         super()._setup_train()
         if getattr(self, "_ycl_has_pretrained", False) and hasattr(self, "ema") and self.ema is not None:
-            self.ema.ema.load_state_dict(self.model.state_dict())
+            self._safe_ema_sync()  # Risk 16 fix — WORK_PLAN §10.23
             self.ema.updates = 0
             _log("[ycl-ft] EMA synced with SSL backbone")
 
     def save_model(self):
         """EMA'yı kaydetmeden önce gerçek modelle senkronize et."""
         if hasattr(self, 'ema') and self.ema is not None:
-            self.ema.ema.load_state_dict(self.model.state_dict())
+            self._safe_ema_sync()  # Risk 16 fix — WORK_PLAN §10.23
         super().save_model()
 
     def preprocess_batch(self, batch):
