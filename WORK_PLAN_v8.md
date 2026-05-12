@@ -25,9 +25,14 @@ A — Foundation ✅, D — SAPS ✅, atılanlar dondurulmuş.
 
 ## 2. Datasets
 
-### 2.1 SSL pretrain pool (~186K driving image) — HENÜZ İNDİRİLMEDİ
-BDD100K (~100K), Mapillary Vistas (~25K), Cityscapes coarse (~20K), A2D2 (~41K).
-Paralel iş, kullanıcı yan tarafta yürütüyor.
+### 2.1 SSL pretrain pool — Tamamlandı (181,446 image)
+Pool: `/content/drive/MyDrive/yolo-contrastive/ssl_pool/` (manifest at `manifest.parquet`). 640px long-side JPEG q=90, aspect-preserved, no upscale.
+- BDD100K: 100,000 (70K train / 10K val / 20K test)
+- Cityscapes: 24,998 (coarse train_extra 19,998 + fine train/val/test 5,000)
+- Mapillary Vistas v2: 25,000 (training 18K + validation 2K + testing 5K)
+- A2D2: 31,448 (cam_front_center only; doc'taki ~41K rakamı 6-kamera toplam frame sayısı)
+
+Adapter modülleri: `src/yolo_contrastive/data/ssl_pool/{bdd100k,a2d2,cityscapes,mapillary}.py`. Materialize idempotent on `image_id`, resume-safe.
 
 ### 2.2 Downstream evaluation
 **Şu anki interim:** Roboflow Pothole 1125 (`/content/datasets/roboflow/data.yaml`)
