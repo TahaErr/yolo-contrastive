@@ -122,7 +122,7 @@ class FinetuneDetectionTrainer(DetectionTrainer):
     def _safe_ema_sync(self) -> None:
         """Sync EMA weights to current model state, robust to InferenceMode taint.
 
-        Background (Risk 16, WORK_PLAN §10.22 + §10.23):
+        Background (Risk 16, WORK_PLAN §10.22 + §10.23 + §10.25):
             Ultralytics' internal validator runs forward passes under
             ``torch.inference_mode()``. After such a pass, parameters or
             buffers on the EMA copy can carry the InferenceMode flag. A
@@ -132,18 +132,48 @@ class FinetuneDetectionTrainer(DetectionTrainer):
                 RuntimeError: Inplace update to inference tensor outside
                               InferenceMode is not allowed.
 
-        Fix: ``assign=True`` (PyTorch 2.1+). Destination tensors are
-        replaced by reference rather than mutated in-place; the old
-        tainted tensors are dropped and the freshly assigned ones inherit
-        no InferenceMode flag.
+        Strategy (v2): rebuild any InferenceMode-tainted parameters and
+        buffers on the destination as detached clones (which carry no
+        inference flag), then call **plain** ``load_state_dict`` (no
+        ``assign=True``). This is critical: ``assign=True`` replaces
+        destination tensors by reference, aliasing EMA storage to the
+        model. Ultralytics' ``ema.update()`` then evaluates
+        ``v *= d; v += (1-d) * msd[k]`` where ``v`` and ``msd[k]`` are the
+        same tensor, collapsing weights by ~2d per step (~99.9% per step
+        at typical early-training decay), zeroing the model within an
+        epoch. See §10.25 for the forensic trail; v1 (assign=True) failed
+        production validation despite passing isolated unit tests.
 
-        Limitation: ``assign=True`` invalidates any optimizer that holds
-        references to the previous parameter tensors. Safe for
-        ``self.ema.ema`` because EMA has no associated optimizer. Do NOT
-        reuse this helper on a module under active optimization without
-        rebuilding the optimizer afterwards.
+        The cleanup step touches only tainted tensors, so this is a
+        no-op when called on a clean module (e.g. during ``_setup_train``
+        before any validator has run).
         """
-        self.ema.ema.load_state_dict(self.model.state_dict(), assign=True)
+        import torch.nn as _nn
+
+        # 1) Rebuild tainted params on destination as clean clones
+        for name, param in list(self.ema.ema.named_parameters()):
+            if param.is_inference():
+                *path, leaf = name.split(".")
+                parent = self.ema.ema
+                for p in path:
+                    parent = getattr(parent, p)
+                parent._parameters[leaf] = _nn.Parameter(
+                    param.detach().clone(),
+                    requires_grad=param.requires_grad,
+                )
+
+        # 2) Rebuild tainted buffers on destination as clean clones
+        for name, buf in list(self.ema.ema.named_buffers()):
+            if buf.is_inference():
+                *path, leaf = name.split(".")
+                parent = self.ema.ema
+                for p in path:
+                    parent = getattr(parent, p)
+                parent._buffers[leaf] = buf.detach().clone()
+
+        # 3) Plain load — copies VALUES into destination's existing tensors,
+        # preserving the independent-storage invariant that EMA requires.
+        self.ema.ema.load_state_dict(self.model.state_dict())
 
     def _setup_train(self, world_size=1):
         """EMA'yı SSL backbone ile senkronize et."""

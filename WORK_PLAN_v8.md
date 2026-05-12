@@ -170,7 +170,7 @@ Bekleyen kararlar: backbone (YOLO-native vs ViT) + scope (full vs essential).
 | 13 | Roboflow `..` path | ✅ unified_loader fallback |
 | 14 | Eval dataset değişimi | data.yaml swap hazır |
 | 15 | SSL'in COCO'yu geçememesi | Faz 4.7 + Yol 3 smoke ölçeğinde GÖZLENDİ. Faz 5'te ~186K + cross-domain ile test edilecek. **Eğer Faz 5'te de geçmezse hipotez sallantıda — fallback domain-specific hikaye.** |
-| **16** | **PyTorch 2.x InferenceMode crash post-train** | ✅ ÇÖZÜLDÜ — `_safe_ema_sync` helper'ında `load_state_dict(state, assign=True)`. Sandbox forensics ile §10.22'nin önerdiği fix'in yetersiz olduğu kanıtlandı, gerçek çözüm §10.23'te. Regression: `tests/test_finetune_risk16.py` (3 test). |
+| **16** | **PyTorch 2.x InferenceMode crash post-train** | ✅ ÇÖZÜLDÜ (v2) — `_safe_ema_sync` taint cleanup + plain `load_state_dict`. v1 (assign=True) production'da EMA aliasing → head collapse oluşturdu, §10.25'te root cause + v2 mechanism + paper-worthy methodological lesson. Regression: `tests/test_finetune_risk16.py` (5 test). |
 
 ---
 
@@ -306,6 +306,9 @@ Bu sınırlama `_safe_ema_sync` docstring'inde açıkça belgelenir; helper'ın 
 
 **Why §10.22's suggestion seemed plausible:** `clone + no_grad` deseni *farklı* bir PyTorch 2.x sorununu çözer — InferenceMode tensor'larından **gradient hesaplama** girişimleri. Risk 16 bu değil; Risk 16 InferenceMode tensor'larına **inplace yazma** girişimleridir. Çözümler orthogonal.
 
+
+**REVERTED (v2):** This v1 fix (`assign=True`) was production-validated against the InferenceMode crash but introduced a catastrophic secondary bug — EMA aliasing causing weights to collapse to ~0 within an epoch. Diagnosed via sandbox forensics + production smoke (head magnitudes = 0 in best.pt after 12-epoch finetune, mAP=0). Replaced by v2 strategy documented in §10.25. The forensics above (Q1 taxonomy, Q2 invariants) remain valid and still motivate the fix; only the *mechanism* changed.
+
 ### 10.24 PretrainMatrix design — academic ablation orchestrator (yeni)
 
 Plan §5'in dört eksenli ablation grid'i (~192 cell) manuel orkestrasyon dışında. `eval/run_matrix.py` benzer iş yapıyor ama sabit (methods/datasets/fractions/seeds) eksen seti ve downstream eval için. Pretrain ablation'ı **parametrik** — ekseni YAML belirler. `pretrain/run_matrix.py` aynı resume/error/CSV iskeletini taşır; iki noktada akademik tercih yapıldı.
@@ -346,6 +349,61 @@ df = pd.concat([df.drop(columns=["axes_json"]), df_axes], axis=1)
 Şema deterministik, merge basit, paper figure pipeline'ı YAML'dan bağımsız.
 
 **Cell ID:** `sha1(json.dumps({axes, seed}, sort_keys=True))[:12]`. Backbone filename + CSV resume key. Deterministik (aynı config → aynı id), çakışmaz (~192 cell'de Birthday < 10⁻⁸), readable (12 hex char), no UUID dependency.
+
+### 10.25 Risk 16 fix v2 — taint cleanup, no aliasing (yeni)
+
+§10.23'te önerilen `load_state_dict(state, assign=True)` fix'i isolated unit testlerde başarılı oldu (crash önlendi, target tensor'ları temizlendi) AMA production validation'da catastrophic — finetune sonrası `best.pt` model.22 head'inin tüm 31 weight'i = 0, mAP = 0.0000 (baseline aynı dataset'te 0.6266). Sandbox forensics + Colab production smoke ile root cause izole edildi.
+
+**Root cause — EMA aliasing:**
+`load_state_dict(state, assign=True)` destination Parameter wrapper'ının iç tensor'unu source referansı ile **REPLACE** eder (in-place copy değil, reference assignment). Sonuç: `ema.ema.param.data` ve `model.param.data` **aynı tensor objesidir** (kanıt: `data_ptr() == data_ptr()`). 
+
+Ultralytics' `ModelEMA.update()` döngüsü:
+```python
+for k, v in ema.ema.state_dict().items():
+    v.mul_(d)                            # in-place: v *= d
+    v.add_(msd[k].detach(), alpha=1 - d) # in-place: v += (1-d) * msd[k]
+```
+`v` ve `msd[k]` aynı tensor olduğunda:
+- `v.mul_(d)` → tensor d ile çarpılır (model.param da scale-down olur, çünkü aynı tensor)
+- `v.add_(msd[k] * (1-d))` → kendi (scaled) değerini kendine ekler  
+- Net: `v_new = d·v + (1-d)·(d·v) = d·v·(1 + (1-d)) ≈ 2d·v`
+
+Ultralytics' decay schedule `decay(s) = 0.9999·(1 - exp(-s/2000))`, ilk step `d ≈ 0.0005` → `v_new ≈ 0.001·v` (**1000x scale-down per step**). 10 step'te `1.0 → 3.5e-24` (effective zero). Sandbox sim ile doğrulanmış (`tests/test_finetune_risk16.py::test_v2_survives_simulated_ema_updates`).
+
+**Doğru çözüm (v2):** Destination'daki tainted tensor'ları rebuild et + plain `load_state_dict` (no `assign=True`):
+
+```python
+def _safe_ema_sync(self):
+    # 1) Rebuild tainted params/buffers as detached clones (clean of inference flag)
+    for name, param in list(self.ema.ema.named_parameters()):
+        if param.is_inference():
+            *path, leaf = name.split(".")
+            parent = self.ema.ema
+            for p in path: parent = getattr(parent, p)
+            parent._parameters[leaf] = nn.Parameter(param.detach().clone(),
+                                                    requires_grad=param.requires_grad)
+    for name, buf in list(self.ema.ema.named_buffers()):
+        if buf.is_inference():
+            *path, leaf = name.split(".")
+            parent = self.ema.ema
+            for p in path: parent = getattr(parent, p)
+            parent._buffers[leaf] = buf.detach().clone()
+    # 2) Plain load — copies VALUES into destination's existing tensors
+    self.ema.ema.load_state_dict(self.model.state_dict())
+```
+
+v2 invariants (3 regression test ile guard'lı):
+- **I1 — Crash prevention:** tainted destination → cleanup sonrası plain load çalışır
+- **I2 — No aliasing:** `ema.param.data_ptr() != model.param.data_ptr()` (kritik)
+- **I3 — EMA stable:** 10 update step sonrası weights kararlı (no collapse)
+
+**Methodological lesson — paper-worthy:**
+
+> Fix'in **unit test correctness'i** integration safety **garanti etmez**. v1 fix isolated bug-reproducing test'i geçti (`test_baseline_crash_reproduces` + `test_assign_true_resolves_crash`) ama production EMA update mechanism ile interaction'da catastrophic. Sandbox forensics'imde optimizer state invalidation'ı (Q3) test ettim AMA **EMA update mekanizmasının kendisi ile assign=True etkileşimi** test edilmedi — kritik blind spot.
+
+> Generalize: bir fix'in unit test'i bug pattern'ını reprodüce ediyor olabilir, ama **fix'in yan etkilerini production-equivalent flow'da test etmeden** deploy etmek tehlikeli. Bizim case'de Risk 16 reprodüksiyonu izole bir minimal example (target taint + load_state_dict çağrısı) idi; **production'da bu çağrı bir Ultralytics ModelEMA update zincirinin içinde**, ve aliasing exploit edilebilir hâle geldi.
+
+Future work: bu pattern'ı bir general principle olarak codify et — fix'lerin "post-fix invariant tests" (sadece original bug değil, fix'in yan etkileri) **production-representative integration test** ile validate edilmeli.
 ---
 
 ## 11. Architecture Sentinels

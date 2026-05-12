@@ -114,20 +114,51 @@ class TestRisk16:
         assert out.shape == (1, 8, 14, 14)
         assert torch.isfinite(out).all()
 
-    def test_safe_ema_sync_uses_assign_true(self):
-        """Code-level sentinel: the helper must contain assign=True.
+    def test_safe_ema_sync_uses_v2_strategy(self):
+        """Code-level sentinel for v2 fix (§10.25).
 
-        Source-level check so the test does not require an actual
-        Ultralytics training context to run. If a refactor accidentally
-        drops the fix, this fires before any Yol 3 / Faz 5 detection run
-        wastes hours only to crash at final_eval.
+        Verifies the helper body (not docstring) avoids ``assign=True`` and
+        uses the taint-cleanup-then-plain-load strategy. The previous v1
+        sentinel only string-matched ``assign=True`` anywhere in the source,
+        which silently passed when v2 mentioned ``assign=True`` in its
+        docstring while no longer using it.
+
+        Uses AST to strip the docstring before checking the executable body,
+        so future docstring edits referencing v1 don't break this test.
         """
-        helper_src = inspect.getsource(FinetuneDetectionTrainer._safe_ema_sync)
-        assert "assign=True" in helper_src, (
-            "Risk 16 fix removed from _safe_ema_sync — restore "
-            "load_state_dict(..., assign=True) per WORK_PLAN §10.23."
+        import ast
+        import textwrap
+
+        raw = inspect.getsource(FinetuneDetectionTrainer._safe_ema_sync)
+        src = textwrap.dedent(raw)
+        funcdef = ast.parse(src).body[0]
+
+        # Drop the docstring node if present
+        body = funcdef.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+        ):
+            body = body[1:]
+        code_only = ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+        # v2 invariants
+        assert "assign=True" not in code_only, (
+            "v2 fix violated — helper body uses assign=True again. "
+            "This caused the EMA aliasing collapse documented in §10.25; "
+            "use plain load_state_dict on a cleaned destination instead."
+        )
+        assert "is_inference" in code_only, (
+            "v2 fix violated — taint-cleanup branch removed. "
+            "Helper must check is_inference() on destination tensors."
+        )
+        assert "detach().clone" in code_only, (
+            "v2 fix violated — taint cleanup must rebuild tainted tensors "
+            "as detached clones."
         )
 
+        # Delegation invariants (same as v1 — these are independent of strategy)
         setup_src = inspect.getsource(FinetuneDetectionTrainer._setup_train)
         save_src = inspect.getsource(FinetuneDetectionTrainer.save_model)
         assert "_safe_ema_sync" in setup_src, (
@@ -135,4 +166,109 @@ class TestRisk16:
         )
         assert "_safe_ema_sync" in save_src, (
             "save_model no longer delegates to _safe_ema_sync"
+        )
+
+    def test_v2_preserves_independent_storage(self):
+        """v2 must NOT alias EMA tensors to model tensors (the v1 catastrophe).
+
+        Reproduces the precise scenario where v1 silently broke: after a
+        sync, do ``ema.weight`` and ``model.weight`` share storage? If yes,
+        Ultralytics' in-place EMA update collapses both to zero within an
+        epoch (§10.25 forensics).
+
+        We invoke the helper in isolation via a minimal stand-in (a plain
+        Module pair) so we don't need to instantiate the Ultralytics
+        DetectionTrainer machinery. The helper's logic is what's under
+        test, not how it's wired into Ultralytics.
+        """
+        # Build a stand-in trainer with just enough surface for the helper
+        class _EMAStub:
+            def __init__(self, mod):
+                self.ema = mod
+
+        class _Stub:
+            pass
+
+        stub = _Stub()
+        stub.model = _make_target_with_tainted_buffers()  # tainted
+        # Replace tainted model with a clean source — taint actually goes on EMA
+        # in real Ultralytics, but the helper handles both directions.
+        clean_source = nn.Sequential(nn.Conv2d(3, 8, 3), nn.BatchNorm2d(8))
+        stub.model = clean_source
+        stub.ema = _EMAStub(_make_target_with_tainted_buffers())
+
+        # Invoke the real helper method bound to our stub
+        FinetuneDetectionTrainer._safe_ema_sync(stub)
+
+        # Critical invariant: no aliasing
+        aliased_params = [
+            n for (n, p_e), (_, p_m) in zip(
+                stub.ema.ema.named_parameters(),
+                stub.model.named_parameters(),
+            )
+            if p_e.data_ptr() == p_m.data_ptr()
+        ]
+        assert not aliased_params, (
+            f"v1 catastrophe reproduced — {len(aliased_params)} params alias model storage: "
+            f"{aliased_params[:3]}. EMA update will collapse weights to zero. See §10.25."
+        )
+
+        # And no leftover InferenceMode taint
+        leftover_taint = [
+            n for n, t in stub.ema.ema.state_dict().items() if t.is_inference()
+        ]
+        assert not leftover_taint, (
+            f"v2 cleanup incomplete — InferenceMode flag still on: {leftover_taint[:3]}"
+        )
+
+    def test_v2_survives_simulated_ema_updates(self):
+        """v2 must keep weights stable under repeated EMA update steps.
+
+        This is the production failure mode: v1 passed crash-prevention
+        tests but collapsed weights by ~99.9% per EMA step (§10.25 sandbox
+        forensics). v2 must show NO such collapse — weights stay at their
+        initial magnitude after 10 simulated updates.
+
+        We use a constant model (no optimizer.step) so the only forces on
+        EMA weights are the update formula itself. If the formula collapses
+        them, the bug is in the sync strategy.
+        """
+        class _EMAStub:
+            def __init__(self, mod):
+                self.ema = mod
+
+        class _Stub:
+            pass
+
+        # Build a model where every weight starts at 1.0 (easy to inspect)
+        def _init_ones(m):
+            with torch.no_grad():
+                for p in m.parameters():
+                    p.data.fill_(1.0)
+            return m
+
+        stub = _Stub()
+        stub.model = _init_ones(nn.Sequential(nn.Conv2d(3, 8, 3), nn.BatchNorm2d(8)))
+        stub.ema = _EMAStub(
+            _make_target_with_tainted_buffers()  # destination has taint
+        )
+
+        FinetuneDetectionTrainer._safe_ema_sync(stub)
+
+        # Simulate Ultralytics-style EMA update for 10 steps with early-training decay.
+        # ModelEMA.decay(updates) = decay_max * (1 - exp(-updates / tau))
+        decay_max, tau = 0.9999, 2000.0
+        for step in range(10):
+            d = decay_max * (1 - torch.exp(torch.tensor(-(step + 1) / tau))).item()
+            msd = stub.model.state_dict()
+            for k, v in stub.ema.ema.state_dict().items():
+                if v.dtype.is_floating_point:
+                    v.mul_(d)
+                    v.add_(msd[k].detach(), alpha=1 - d)
+
+        # All weights should still be ≈ 1.0 — no collapse, no aliasing exploit
+        final = next(iter(stub.ema.ema.parameters()))[0, 0, 0, 0].item()
+        assert abs(final - 1.0) < 1e-3, (
+            f"EMA weight collapsed to {final:.6e} after 10 updates — "
+            f"v1 aliasing bug pattern detected. See §10.25 for full forensics."
         )
