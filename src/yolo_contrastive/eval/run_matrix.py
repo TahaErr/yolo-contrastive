@@ -165,15 +165,171 @@ def _run_linear_probe(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any
 
 
 def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
-    """Detection runner — STUB. Will be filled in Faz 5 with Ultralytics call.
+    """Detection runner — YOLO + FinetuneDetectionTrainer integration.
 
-    Faz 5 implementation: load backbone via env vars (YCL_PRETRAINED + freeze
-    settings), call YOLO(...).train(data=..., trainer=FinetuneDetectionTrainer).
-    Capture final mAP50 from results object.
+    Implements WORK_PLAN_v9 §13.7. Replaces the v8 STUB that raised
+    NotImplementedError. Risk 16 v2 fix (§10.25) makes this safe — without
+    v2, the post-train EMA aliasing would silently collapse model.head and
+    produce mAP=0 across all cells.
+
+    Hyperparameters (read from YAML ``hp:`` section, paper-grade defaults):
+        base_model:           ultralytics model spec, default "yolov8n.pt"
+        epochs:               training epochs, default 30
+        imgsz:                input image size, default 640
+        batch:                batch size, default 16
+        freeze:               freeze layers 0..freeze, default 10
+                              (forwarded to FinetuneDetectionTrainer via
+                              YCL_FREEZE_BACKBONE env var)
+        unfreeze_epoch:       epoch to release frozen layers, default 5
+                              (env var YCL_UNFREEZE_EPOCH)
+        backbone_lr_scale:    LR multiplier for backbone params, default 0.5
+                              (env var YCL_BACKBONE_LR_SCALE)
+        device:               cuda device index, default 0
+        project:              output directory, default "/content/runs/eval_matrix"
+
+    Cell-level reads:
+        cell["method"]["backbone_ckpt"]   SSL backbone (env var YCL_PRETRAINED)
+        cell["dataset"]["data_yaml"]      Ultralytics data.yaml path
+        cell["cell_id"]                   8-char short id for run name (if present)
+        cell["seed"]                      passed to torch.manual_seed
+        cell["fraction"]                  metadata only (logged, not consumed —
+                                          fraction implicit in dataset.data_yaml)
+
+    Returns:
+        {
+            "metric": "mAP50-95",         # main metric (CSV's metric_value)
+            "metric_value": float,
+            "mAP50": float,
+            "precision": float,
+            "recall": float,
+        }
+
+    Env var lifecycle:
+        YCL_* env vars are set BEFORE Ultralytics import + YOLO call, then
+        restored to their original values (or unset if originally unset)
+        in a finally block. This isolates each cell — concurrent or
+        sequential RunMatrix invocations don't bleed state.
+
+    Error handling:
+        Any exception (ImportError if ultralytics missing, RuntimeError if
+        CUDA fails, FileNotFoundError if backbone_ckpt missing) propagates
+        up. RunMatrix.run(on_error="continue") catches it and writes a
+        "failed" row with the error message.
     """
-    raise NotImplementedError(
-        "Detection runner is a stub. Faz 5 will integrate Ultralytics YOLO.train."
-    )
+    import os
+
+    from ultralytics import YOLO
+    from ..finetune import FinetuneDetectionTrainer  # noqa: F401 — registers trainer
+
+    # ── read cell + hp with defaults ─────────────────────────────────────
+    backbone_ckpt = cell["method"].get("backbone_ckpt")
+    if not backbone_ckpt:
+        raise ValueError(
+            "_run_detection requires cell['method']['backbone_ckpt']; "
+            "got missing/empty value"
+        )
+
+    data_yaml = cell["dataset"].get("data_yaml")
+    if not data_yaml:
+        raise ValueError(
+            "_run_detection requires cell['dataset']['data_yaml']; "
+            "got missing/empty value"
+        )
+
+    base_model = hp.get("base_model", "yolov8n.pt")
+    epochs = int(hp.get("epochs", 30))
+    imgsz = int(hp.get("imgsz", 640))
+    batch = int(hp.get("batch", 16))
+    freeze = int(hp.get("freeze", 10))
+    unfreeze_epoch = int(hp.get("unfreeze_epoch", 5))
+    backbone_lr_scale = float(hp.get("backbone_lr_scale", 0.5))
+    device = hp.get("device", 0)
+    project = hp.get("project", "/content/runs/eval_matrix")
+
+    # Seed for reproducibility (matches linear_probe runner pattern)
+    seed = int(cell.get("seed", 42))
+    import random
+    import torch
+    random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+
+    # Run name: cell_id if present (PretrainMatrix sister convention), else
+    # fall back to method+dataset+seed string
+    cell_id = cell.get("cell_id", "")
+    if cell_id:
+        run_name = f"cell_{cell_id[:8]}"
+    else:
+        run_name = (
+            f"{cell['method']['name']}_"
+            f"{cell['dataset']['name']}_seed{seed}"
+        )
+
+    # ── env var pattern: set, run, restore (lifecycle isolation) ─────────
+    env_overrides = {
+        "YCL_PRETRAINED": str(backbone_ckpt),
+        "YCL_FREEZE_BACKBONE": str(freeze),
+        "YCL_UNFREEZE_EPOCH": str(unfreeze_epoch),
+        "YCL_BACKBONE_LR_SCALE": str(backbone_lr_scale),
+    }
+    env_backup = {k: os.environ.get(k) for k in env_overrides}
+
+    try:
+        for k, v in env_overrides.items():
+            os.environ[k] = v
+
+        model = YOLO(base_model)
+        try:
+            results = model.train(
+                data=data_yaml,
+                epochs=epochs,
+                imgsz=imgsz,
+                batch=batch,
+                device=device,
+                trainer=FinetuneDetectionTrainer,
+                project=project,
+                name=run_name,
+                exist_ok=True,
+                verbose=False,
+                plots=False,
+            )
+        finally:
+            # Free GPU memory before returning so the next cell starts
+            # with a clean slate (especially important on smaller GPUs)
+            del model
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        # ── extract metrics from results object ──────────────────────────
+        # Ultralytics results.box has: map (mAP50-95), map50, mp (precision),
+        # mr (recall). All are torch tensors → cast to float.
+        if not hasattr(results, "box"):
+            raise RuntimeError(
+                "_run_detection: results object has no .box attribute "
+                f"(got {type(results).__name__}); Ultralytics API may have changed"
+            )
+
+        return {
+            "metric": "mAP50-95",
+            "metric_value": float(results.box.map),
+            "mAP50": float(results.box.map50),
+            "precision": float(results.box.mp),
+            "recall": float(results.box.mr),
+        }
+
+    finally:
+        # Restore env (whether train succeeded or raised)
+        for k, original in env_backup.items():
+            if original is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = original
 
 
 DEFAULT_RUNNERS: Dict[str, Callable[..., Dict[str, Any]]] = {
