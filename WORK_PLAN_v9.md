@@ -243,7 +243,9 @@ src/yolo_contrastive/
       ablation_stage6_foundation.yaml ⬜ Faz 5.5 (DINOv2 referans)
 ```
 
-### 4.2 Legacy Hat — geriye uyumlu, hâlâ aktif (kullanıcı UX katmanı)
+### 4.2 Legacy Hat — geriye uyumlu, hâlâ AKTİF (paper-grade modüller içerir)
+
+Plan v8'de bu hat'ın bir kısmı "DONDURULDU" olarak işaretlenmişti — **v9 envanteri (INVENTORY.md §2.2) sonrası DÜZELTİLDİ**: `pretext/` ve `adapters/` aktif, README'de dokümante edilmiş modüllerdir (FrequencyBandPrediction paper-grade novelty claim'i içerir, §14.3).
 
 ```
 src/yolo_contrastive/
@@ -254,46 +256,116 @@ src/yolo_contrastive/
                                       §13.8'de DenseSSLPretrainer'a rewire (Seçenek Y geriye uyumlu)
   discovery.py                        ✓ DatasetInfo + TrainMode + discover()
                                       Auto dataset structure detection (SSL_FINETUNE / DETECTION / SSL_ONLY)
-  exceptions.py                       ✓ YoloContrastiveError + alt-exception hiyerarşisi
+  exceptions.py                       ✓ YoloContrastiveError + 4 alt-exception (FeatureTapError,
+                                      ContrastiveLossError, ConfigError, PatchError)
+  _config.py                          ✓ HIDDEN — CLConfig.from_env() (15+ YCL_* env var)
+                                      ContrastiveDetectionTrainer'ın `_ensure_cl(batch)` ile
+                                      ilk batch'te yüklediği config. Plan v8'de yoktu; v9
+                                      envanteri sonrası eklendi (INVENTORY §5.2).
 
   # ── Pre-Faz 1 SSL hattı (saf global-pooling CL, korunur) ──────────────
   contrastive/
-    losses.py                         ✓ NTXentLoss + build_contrastive_loss
-  feature_tap.py                      ✓ Single-output FeatureTap [B, D] (eski API)
-  trainer/
-    _core.py                          ✓ ContrastiveDetectionTrainer (eski API)
+    losses.py                         ✓ NTXentLoss + build_contrastive_loss (ntxent/infonce/simclr)
+  feature_tap.py                      ✓ Single-output FeatureTap [B, D] — auto-selects backbone layer
+                                      (modern hat'ta dense MultiScaleFeatureTap kullanılır;
+                                      legacy hat + LinearProbeTrainer bunu kullanır)
+  trainer/                            ✓ Multi-inheritance trainer architecture
+    _core.py                          ✓ ContrastiveDetectionTrainer = DetectionTrainer +
+                                      AugmentationMixin + PatchingMixin + CSVLoggerMixin
+    _helpers.py                       ✓ log, safe_scalar, extract_loss_from_out, replace_in_output
+                                      is_main_process, preserve_bn_running_stats
+    _augmentation.py                  ✓ AugmentationMixin — view2 generation (gaussian blur cache,
+                                      flip/gray/color jitter — legacy torch-only)
+    _patching.py                      ✓ PatchingMixin — _install_model_patches, forward override
+                                      _patch_loss_for_compile (torch.compile uyumluluğu)
+                                      _inject_all (det + CL + pretext)
+    _csv_logger.py                    ✓ CSVLoggerMixin — thread-safe per-step CSV writer (_csv_lock)
   pretrain/
-    trainer.py                        ✓ SSLPretrainer (legacy — pipeline.py kullanıyor)
+    trainer.py                        ✓ SSLPretrainer (legacy — pipeline.py + ContrastiveDetectionTrainer
+                                      ile birlikte kullanılır). Composite pretext + LoRA adapter desteği.
+
+  # ── Pretext task system (paper-grade — README'de "novel contribution" claim'i) ──
+  pretext/                            ✅ AKTİF (plan v8'de yanlışlıkla "DONDURULDU" yazılmıştı)
+    base.py                           ✓ BasePretextTask + register_task decorator + global registry
+    heads.py                          ✓ ProjectionHead + PredictionHead
+    rotation.py                       ✓ RotationTask — 4-class 0°/90°/180°/270° (legacy IE-Rot)
+    tasks.py                          ✓ SolarizationTask (4-cls) + ColorPermutationTask (6-cls) +
+                                      PatchShuffleTask (24-cls Jigsaw-lite) + BlurPredictionTask (4-cls)
+    freq_band.py                      ✓ FrequencyBandPrediction (4-cls FFT band masking)
+                                      README iddiası: "first in image SSL for detection"
+                                      Bu paper'da gelecek work olarak işaret edilir (§14.3 — Seçenek B)
+    composite.py                      ✓ CompositeTask — multi-task combiner
+                                      transform sırayla uygulanır, tek embedding ile çok head
+
+  # ── LoRA adapter system (parameter-efficient domain adaptation) ──────
+  adapters/                           ✅ AKTİF (plan v8'de yanlışlıkla "DONDURULDU" yazılmıştı)
+    conv_lora.py                      ✓ ConvLoRA — Conv2d için plain LoRA (rank-r decomp, initial-zero)
+    freq_gate.py                      ✓ FreqGate — frequency-domain gating module
+    freq_gated_lora.py                ✓ FreqGatedConvLoRA — ConvLoRA + FreqGate
+    task_routed_lora.py               ✓ TaskRoutedConvLoRA + TaskRouter + LoRABranch
+                                      (multi-task LoRA routing — pretext task'lar için)
+    inject.py                         ✓ inject_lora + remove_lora + _freeze_backbone_non_lora
+                                      SSLPretrainer + ContrastiveDetectionTrainer içinden çağrılır
+    merge.py                          ✓ compute_merge_alphas + merge_task_routed_model
+                                      (task-routed LoRA merging into single backbone)
 
   # ── Augmentation system (legacy ve modern hatlarda kullanılabilir) ────
-  augmentations/                      ✓ Modular augmentation framework
-    registry.py                       ✓ BaseAugmentation + register + get + list
-    presets.py                        ✓ PRESETS (named augmentation pipelines)
+  augmentations/                      ✓ Modular augmentation framework (20 primitif + 4 preset)
+    registry.py                       ✓ BaseAugmentation + PerImageAugmentation + AugmentationPipeline
+                                      + register decorator + get_augmentation + list_augmentations
+    presets.py                        ✓ PRESETS = {simclr_v1, simclr_v2, byol, aggressive} + build_pipeline
     geometric.py                      ✓ HFlip, VFlip, Rotation90, Rotation, Affine
     color.py                          ✓ Brightness, Contrast, Saturation, Hue, ColorJitter,
-                                          Grayscale, Solarize, Posterize, Equalize
+                                          Grayscale, Solarize, Posterize, Equalize (9 primitif)
     erasing.py                        ✓ Cutout, Erasing, GridMask
     filtering.py                      ✓ GaussianBlur, GaussianNoise, Sharpen
-                                      (13 augmentation primitif total)
-                                      Faz 5.3 dual-teacher karar §5.3'te
+                                      Faz 5.3 dual-teacher photometric aug eksen → §5.3'te
 ```
 
-### 4.3 Durdurulan hatlar
+### 4.3 Durdurulan hatlar (DÜZELTME — v8'de yanlış sınıflandırıldı)
 
 ```
 src/yolo_contrastive/
-  adapters/                           ❄ DONDURULDU — single-backbone adapter sistemi
-  pretext/                            ❄ DONDURULDU — rotation/jigsaw pretext task'ları
+  # Plan v8 burada "adapters/, pretext/ DONDURULDU" yazmıştı — YANLIŞ.
+  # v9 envanteri (INVENTORY.md §2.2): her ikisi de aktif, README dokümanlı.
+  # Tek dondurulan: yok (şu anda durdurulmuş alt-modül yok).
 ```
+
+**Sonuç:** `pretext/` ve `adapters/` AKTİF legacy hat içinde, §4.2'de listelendi. Plan v8'in "DONDURULDU" sınıflandırması v9 envanteri ile düzeltildi.
 
 ### 4.4 Test toplamı + dağılım
 
-**Mevcut test toplam:** 710 (commit `bb6796d` sonrası)
+**Mevcut test toplam:** 726 (commit `a45c18b` sonrası — INVENTORY.md commit dahil hâlâ aynı)
 
-- Modern hat: ~485 test (dense/ 213 + pretrain/dense_trainer 48 + pretrain/run_matrix 34 + finetune 5 + eval/linear_probe 28 + eval/run_matrix 26 + data/label_fraction 30 + data/unified_loader 32 + data/dedup 510 *küçük modüller dahil ~509*)
-- Legacy hat: ~225 test (contrastive 22 + feature_tap 18 + trainer 14 + pretrain/trainer 28 + augmentations ~80 + pipeline ~30 + discovery ~30 + exceptions)
+Dağılım (INVENTORY.md §8 audit'inden):
+- **Modern Dense Hat:** ~485 test
+  - `dense/` 213 (multi_scale_tap 23 + queue 32 + momentum 26 + spatial_aug 26 + dense_loss 29 + multi_scale_loss 19 + projection 21 + saps 37)
+  - `pretrain/dense_trainer` 48 (+ realyolo 10)
+  - `pretrain/run_matrix` 34 (PretrainMatrix)
+  - `finetune/trainer` 5 (Risk 16 v2 regression)
+  - `eval/linear_probe` 28
+  - `eval/run_matrix` 26 + `run_matrix_detection` 15 (Adım 2)
+  - `data/label_fraction` 30 + `unified_loader` 32
+  - `data/ssl_pool` + `data/dedup` ~160
+- **Legacy Pretext Hat:** ~95 test (envanter sonrası ↑ revize)
+  - `contrastive/losses` ~15
+  - `feature_tap` ~10
+  - `augmentations` ~10
+  - `pretext/` ~25 (6 task + composite parametric)
+  - `adapters/` ~25 (ConvLoRA + FreqGate + FreqGated + TaskRouted + inject + merge)
+  - `pretrain/trainer` (SSLPretrainer) 5 (slow tag dahil)
+  - `trainer/_core` (ContrastiveDetectionTrainer) ~5 indirekt
+- **UX Façade Hat:** ~5 test (sadece import smoke)
+  - `pipeline.py` + `discovery.py` + `auto_train` + `_config.py` için **dedicated test yok** (Aşama B'nin asıl boşluğu — INVENTORY §8 sonu)
+- **Top-level smoke:** 2 (test_import.py)
 
-Faz 5.3 dual_teacher/ modülleri eklendiğinde tahmini **+60-80 test** (consensus loss invariants + disagreement weighting + cache I/O). §13.7 _run_detection implement'inde **+15-20 test**. §13.8 pipeline rewire'da **+10 test**. Toplam Faz 5.3 sonu: **~800 test**.
+**Coverage gap:** UX hat'ı + `_config.py` env var loading dedicated test eksik. Aşama B integration smoke suite bu boşluğu kapatacak.
+
+**Faz 5 sonrası tahmini test sayısı:**
+- §13.8 pipeline rewire: **+10 test** (Seçenek Y dispatcher + PipelineConfig forwarding)
+- Faz 5.3 dual_teacher/ modülleri: **+60-80 test** (consensus loss + disagreement + cache I/O)
+- Aşama B integration smoke (yeni — UX coverage gap için): **+15-20 test**
+- **Toplam Faz 5.3 sonu:** ~810-840 test
 
 ### 4.5 Modern vs Legacy hat — kullanım yönergesi
 
@@ -873,6 +945,36 @@ Faz 5.2 her 6 backbone için saf SAPS sonucu çıktığında bu sentinel'a doldu
 
 **Fair comparison invariant:** Her backbone için **aynı finetune config** (imgsz, batch, freeze, lr_scale, unfreeze_epoch), sadece pretrain backbone değişir.
 
+### 11.11 Top-level `__init__.py` export gap sentinel (v9 yeni — INVENTORY §1 bulgusu)
+
+INVENTORY.md §1.1 envanteri ortaya çıkardı: `src/yolo_contrastive/__init__.py` v0.2.0 modern hat'ı top-level export ETMİYOR. Kullanıcı `DenseSSLPretrainer`, `FinetuneDetectionTrainer`, `multi_scale_dense_loss`, `saps_within_loss` gibi paper'ın asıl modüllerine **alt-paket import** ile erişebiliyor:
+
+```python
+# ❌ from yolo_contrastive import DenseSSLPretrainer  # ImportError
+# ✅ from yolo_contrastive.pretrain import DenseSSLPretrainer  # OK
+```
+
+**Mevcut top-level export'lar (sadece 14 sembol):**
+```python
+__all__ = [
+    "__version__",
+    "NTXentLoss", "build_contrastive_loss", "FeatureTap",        # Legacy hat
+    "SSLFinetunePipeline", "PipelineConfig", "auto_train",       # UX façade
+    "discover", "DatasetInfo", "TrainMode",                       # Discovery
+    "YoloContrastiveError", "FeatureTapError",
+    "ContrastiveLossError", "ConfigError", "PatchError",          # Exceptions
+]
+```
+
+**Modern hat top-level değil.**
+
+**Sentinel:** İleride `__init__.py` güncellenip modern hat top-level export eklendiğinde (§13.8 pipeline rewire sonrası anlamlı olur), şu invariant kontrol edilmeli:
+- `from yolo_contrastive import auto_train` → modern hat default kullanır (Seçenek Y)
+- `from yolo_contrastive import DenseSSLPretrainer` → ImportError VERMEMELI (eklendiyse)
+- Mevcut tüm import'lar geriye uyumlu olmalı (3 hat aynı anda erişilebilir)
+
+**Test bağlantısı:** `tests/test_import.py` şu an sadece 2 test içeriyor (`test_import_version`, `test_convenience_imports` — sadece legacy). §13.8 sonrası bu test dosyası genişletilmeli.
+
 ---
 
 ## 12. Şu Anki Durum
@@ -880,9 +982,10 @@ Faz 5.2 her 6 backbone için saf SAPS sonucu çıktığında bu sentinel'a doldu
 **Kütüphane: TAM İŞLEVSEL ✅**
 **Risk 16 v2 ile production-validated ✅**
 **Faz 5 ablation grid YAML'ları hazır ✅**
+**INVENTORY.md ile kütüphanenin tüm yüzeyi haritalandı ✅** (commit `a45c18b`)
 
 Kanıtlar:
-- 710 test geçer durumda
+- **726 test geçer durumda** (commit `87d3e9d` sonrası: 710 + 15 yeni `_run_detection` + 1 toplam fark)
 - Foundation + SAPS + Eval altyapı + SSL pretrain E2E + Detection finetune E2E + PretrainMatrix orchestrator
 - Ablation parametreleri hazır: `saps_mode`, `saps_both_lambda`, `saps_t_scale`, `queue_update_strategy`, `queue_subsample_n`, `early_stopping_patience`
 - 3-stage ablation YAML (configs/pretrain/) commit `bb6796d`
@@ -1222,8 +1325,34 @@ Paper supplementary §A'da, kronolojik olarak:
 7. **External baselines (Faz 5.4):** CoMAD-YOLO + SimCLR-YOLO + MoCo-v3 portları — "vs SOTA" karşılaştırması paper tablosu.
 8. **Foundation reference (Faz 5.5):** DINOv2 referans satır — "we don't aim to beat foundation models on 1000x more data; we propose a real-time domain-specialized alternative" konumlanması.
 9. **Multi-backbone validation (Faz 5.2):** Generalization claim — 6 nano YOLO mimarisinde (v8/v9/v10/v11/v12/v26) tutarlı kazanım.
+10. **INVENTORY.md tam library audit (v9):** UX iyileştirmesi öncesi 4 API hattı haritalandı (commit `a45c18b`). Plan v8'in `pretext/` ve `adapters/` "DONDURULDU" yanlış sınıflandırması düzeltildi (§4.2'de detaylı).
 
 **Honest claim:** "Our pure SSL baseline does not surpass COCO supervised pretraining in our traffic detection setting. We propose DT-SAPS to bridge this gap via dual-teacher knowledge transfer, demonstrating that domain-specialized SSL+ can match or exceed general-purpose supervised pretraining when augmented with proper teacher distillation."
+
+#### 14.3a Scope kararı — FrequencyBandPrediction (v9'da karar verildi)
+
+Library audit (INVENTORY.md §2.2) repository'de `pretext/freq_band.py` modülünün **README'de "novel contribution" claim'i** içerdiğini ortaya çıkardı:
+
+> *"FrequencyBandPrediction — novel frequency domain pretext task (first in image SSL for detection)."* — README.md, "Features" section.
+
+Modül implement edilmiş + test edilmiş + dokümante (`tests/test_pretext.py` parametric coverage). Bu, paper'a ikinci bir novelty olarak dahil edilebilir veya gelecek work'e bırakılabilir.
+
+**Karar (kullanıcı, 2026-05-14): Seçenek B — bahset ama eksen değil.**
+
+**Gerekçe:**
+- Paper'ın asıl yenisi **DT-SAPS dual-teacher framework**. Anlatım hatları temiz: 4-axis novelty (§14.1), Risk 16 forensics (§10.25), method evolution (Faz 1→DT-SAPS).
+- FrequencyBandPrediction'ı eklemek bu odağı dağıtır. İki novelty'yi bir paper'a sıkıştırmak hikayeyi zayıflatır.
+- Modül **gelecek work** olarak konumlanır. Bu paper kabul olduktan sonra ayrı bir kısa paper'a malzeme olur ("FreqBandPretext for YOLO Detection — Standalone Frequency-Domain SSL").
+
+**Paper supplementary §A için anlatım:**
+
+> *"During library development we implemented a frequency-domain pretext task (FrequencyBandPrediction — FFT band masking + IFFT reconstruction + band-id prediction; module `pretext/freq_band.py`). To the best of our knowledge this is the first application of frequency-band pretext to image SSL for object detection, building on time-series SSL precedents (TF-C, TRLS, FreMixer). However, ablating this orthogonal axis would dilute the present paper's focus on DT-SAPS dual-teacher distillation. We defer the FrequencyBandPrediction evaluation to a follow-up study, where it can be cleanly compared against standard pretext baselines (rotation, jigsaw, colorization) without entanglement with our hybrid-teacher framework."*
+
+**Aksiyon planı:**
+- Faz 5'te FrequencyBandPrediction ablation **eksen olarak yok**
+- README'deki claim korunur (gelecek work çağrısı)
+- Paper supplementary §A.3'te yukarıdaki paragraf yer alır
+- Repo'da modül **bozulmadan korunur** — paper kabul sonrası ayrı paper için hazır
 
 ### 14.4 Compute budget transparency
 
