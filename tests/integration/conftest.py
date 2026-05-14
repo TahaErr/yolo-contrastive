@@ -324,7 +324,7 @@ def tiny_dense_backbone(tmp_workspace: Path, yolov8n_weights_path):
                 images_dir=str(img_dir), epochs=epochs,
                 batch_size=2, lr=1e-3, warmup_epochs=0,
                 num_workers=0, output=str(out_path),
-                save_every=0, print_every=0,
+                save_every=0, print_every=1,
             )
         finally:
             trainer.cleanup()
