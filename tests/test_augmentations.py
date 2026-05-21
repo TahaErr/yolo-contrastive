@@ -6,7 +6,7 @@ from yolo_contrastive.augmentations import (
 )
 
 
-@pytest.mark.parametrize("name", ["simclr_v1", "simclr_v2", "byol", "aggressive"])
+@pytest.mark.parametrize("name", ["simclr_v1", "simclr_v2", "byol", "aggressive", "mocov3_v3_v2", "dino_v1"])
 def test_preset(name, batch_img):
     pipe = build_pipeline(name)
     out = pipe(batch_img)
