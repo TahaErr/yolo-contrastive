@@ -316,3 +316,48 @@ class TestRealYOLOv8x:
             assert feats["P3"].shape[2] > feats["P4"].shape[2] > feats["P5"].shape[2]
         finally:
             teacher.cleanup()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# SSL checkpoint loading — CocoTeacher wraps the SSL teacher too, so it must
+# accept an SSL pretraining checkpoint (save_backbone output), not only
+# standard Ultralytics weights.
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class TestSSLCheckpointLoading:
+    def test_is_ssl_checkpoint_detects_format(self, tmp_path):
+        from yolo_contrastive.dual_teacher.coco_teacher import _is_ssl_checkpoint
+        import torch
+        ssl_path = tmp_path / "ssl.pt"
+        torch.save({"model_state_dict": {"x": torch.zeros(1)}, "epoch": 1},
+                   ssl_path)
+        assert _is_ssl_checkpoint(str(ssl_path)) is True
+
+        ultra_path = tmp_path / "ultra.pt"
+        torch.save({"model": "fake_model_obj", "epoch": 1}, ultra_path)
+        assert _is_ssl_checkpoint(str(ultra_path)) is False
+
+    def test_is_ssl_checkpoint_unreadable_path(self):
+        from yolo_contrastive.dual_teacher.coco_teacher import _is_ssl_checkpoint
+        assert _is_ssl_checkpoint("/nonexistent/path.pt") is False
+
+    @pytest.mark.slow
+    def test_coco_teacher_loads_ssl_checkpoint(self, tmp_path):
+        """CocoTeacher(weights=ssl_ckpt) loads an SSL checkpoint into a
+        YOLOv8n skeleton — the real Faz 5.3 SSL-teacher path."""
+        from ultralytics import YOLO
+        from yolo_contrastive.pretrain import save_backbone
+        from yolo_contrastive.dual_teacher import CocoTeacher
+
+        skeleton = YOLO("yolov8n.pt").model
+        ckpt = tmp_path / "saps_backbone.pt"
+        save_backbone(skeleton, str(ckpt), epoch=3, extra={"type": "dense_ssl"})
+
+        teacher = CocoTeacher(weights=str(ckpt), device="cpu")
+        try:
+            assert teacher.backbone is not None
+            assert set(teacher.teacher_channels.keys()) == {"P3", "P4", "P5"}
+        finally:
+            if hasattr(teacher, "cleanup"):
+                teacher.cleanup()

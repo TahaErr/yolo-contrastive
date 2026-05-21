@@ -40,13 +40,28 @@ import torch.nn as nn
 from ..dense import MultiScaleFeatureTap, infer_in_channels
 
 
+def _is_ssl_checkpoint(path: str) -> bool:
+    """True if `path` is an SSL pretraining checkpoint produced by
+    save_backbone — a dict carrying a raw state_dict under the
+    "model_state_dict" key. False for a standard Ultralytics checkpoint
+    (weights under a "model" key) or anything unreadable."""
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    return isinstance(ckpt, dict) and "model_state_dict" in ckpt
+
+
 class CocoTeacher(nn.Module):
     """Frozen COCO YOLOv8x feature teacher with a trainable per-scale adapter.
 
     Args:
-        weights: an Ultralytics model spec (e.g. ``"yolov8x.pt"``) or a
-            pre-built ``nn.Module`` backbone. A string triggers ultralytics
-            import + ``YOLO(weights).model`` extraction.
+        weights: an Ultralytics model spec (e.g. ``"yolov8x.pt"``), an SSL
+            pretraining checkpoint (``save_backbone`` output — loaded into
+            an ``arch`` skeleton), or a pre-built ``nn.Module`` backbone.
+        arch: skeleton spec used when ``weights`` is an SSL checkpoint.
+            Default ``"yolov8n.pt"`` — the DT-SAPS SSL teacher is
+            student-symmetric.
         levels: FPN levels to tap. Default ``("P3", "P4", "P5")``. Pass a
             subset (e.g. ``("P5",)``) for the P5-only cache strategy (§2.4).
         student_channels: ``{level: channel_count}`` of the student backbone.
@@ -63,6 +78,7 @@ class CocoTeacher(nn.Module):
         weights: Union[str, nn.Module] = "yolov8x.pt",
         levels: tuple = ("P3", "P4", "P5"),
         student_channels: Optional[Dict[str, int]] = None,
+        arch: str = "yolov8n.pt",
         device: Optional[Union[str, torch.device]] = None,
     ):
         super().__init__()
@@ -74,9 +90,22 @@ class CocoTeacher(nn.Module):
             self.device = torch.device(device)
 
         # ── load backbone ────────────────────────────────────────────────
+        # A string `weights` is either a standard Ultralytics checkpoint
+        # (e.g. yolov8x.pt — weights under a "model" key) or an SSL
+        # pretraining checkpoint (save_backbone output — a raw state_dict
+        # under "model_state_dict", carrying no architecture). An SSL
+        # checkpoint is loaded into an `arch` skeleton via load_backbone;
+        # the DT-SAPS SSL teacher is student-symmetric, so arch defaults
+        # to yolov8n.pt.
         if isinstance(weights, str):
             from ultralytics import YOLO
-            self.backbone: nn.Module = YOLO(weights).model
+            if _is_ssl_checkpoint(weights):
+                from ..pretrain.backbone_utils import load_backbone
+                self.backbone = YOLO(arch).model
+                load_backbone(self.backbone, weights,
+                              strict=False, verbose=False)
+            else:
+                self.backbone = YOLO(weights).model
         else:
             self.backbone = weights
         self.backbone = self.backbone.to(self.device)
