@@ -52,14 +52,35 @@ class PipelineConfig:
     ssl_epochs: int = 100
     ssl_batch: int = 32
     ssl_lr: float = 1e-3
-    ssl_aug_preset: str = "simclr_v2"
-    ssl_lambda_cl: float = 1.0
-    ssl_lambda_rot: float = 0.5
     ssl_temperature: float = 0.2
     ssl_warmup_epochs: int = 5
     ssl_num_workers: int = 4
     ssl_save_every: int = 25
     ssl_print_every: int = 10
+
+    # SSL hat seçici — "dense" (modern, DT-SAPS; varsayılan) | "legacy"
+    # (rotation/composite-pretext SSLPretrainer; ablation/baseline için).
+    # Modern hat paper'ın asıl katkısı: auto_train() varsayılan olarak
+    # dense + SAPS pretraining çalıştırır.
+    ssl_method: str = "dense"
+
+    # -- Dense hat (ssl_method == "dense") — DenseSSLPretrainer parametreleri.
+    # Varsayılanlar production validation run'ından (§11.8) alındı.
+    ssl_out_dim: int = 128
+    ssl_queue_size: int = 4096
+    ssl_momentum: float = 0.99
+    ssl_n_query: int = 128
+    ssl_pos_radius: float = 0.07
+    ssl_match_mode: str = "threshold"
+    ssl_saps_mode: str = "both"
+    ssl_saps_t_scale: float = 1.0
+    ssl_saps_both_lambda: float = 1.0
+    ssl_queue_update_strategy: str = "pooled"
+
+    # -- Legacy hat (ssl_method == "legacy") — SSLPretrainer parametreleri.
+    ssl_aug_preset: str = "simclr_v2"
+    ssl_lambda_cl: float = 1.0
+    ssl_lambda_rot: float = 0.5
 
     # Fine-tuning / Detection
     ft_epochs: int = 50
@@ -137,34 +158,66 @@ class SSLFinetunePipeline:
         output = output or self.cfg.backbone_path
 
         _log("\n" + "=" * 60)
-        _log("🔬 SSL Pretraining")
+        _log(f"🔬 SSL Pretraining (method={self.cfg.ssl_method})")
         _log("=" * 60)
 
-        from .pretrain import SSLPretrainer
+        # ssl_method dallanması — yalnızca constructor farklı; train()
+        # imzası iki hatta da bit-aynı (DenseSSLPretrainer docstring:
+        # "API parity ... swapped drop-in").
+        if self.cfg.ssl_method == "dense":
+            from .pretrain import DenseSSLPretrainer
 
-        pretrainer = SSLPretrainer(
-            model=self.cfg.model,
-            aug_preset=self.cfg.ssl_aug_preset,
-            lambda_cl=self.cfg.ssl_lambda_cl,
-            lambda_rot=self.cfg.ssl_lambda_rot,
-            temperature=self.cfg.ssl_temperature,
-            imgsz=self.cfg.imgsz,
-            device=self.cfg.device,
-        )
+            pretrainer = DenseSSLPretrainer(
+                model=self.cfg.model,
+                out_dim=self.cfg.ssl_out_dim,
+                queue_size=self.cfg.ssl_queue_size,
+                momentum=self.cfg.ssl_momentum,
+                temperature=self.cfg.ssl_temperature,
+                n_query=self.cfg.ssl_n_query,
+                pos_radius=self.cfg.ssl_pos_radius,
+                match_mode=self.cfg.ssl_match_mode,
+                saps_mode=self.cfg.ssl_saps_mode,
+                saps_t_scale=self.cfg.ssl_saps_t_scale,
+                saps_both_lambda=self.cfg.ssl_saps_both_lambda,
+                queue_update_strategy=self.cfg.ssl_queue_update_strategy,
+                imgsz=self.cfg.imgsz,
+                device=self.cfg.device,
+            )
+        elif self.cfg.ssl_method == "legacy":
+            from .pretrain import SSLPretrainer
 
-        t0 = time.time()
-        self.backbone_path = pretrainer.train(
-            images_dir=images_dir,
-            epochs=self.cfg.ssl_epochs,
-            batch_size=self.cfg.ssl_batch,
-            lr=self.cfg.ssl_lr,
-            warmup_epochs=self.cfg.ssl_warmup_epochs,
-            num_workers=self.cfg.ssl_num_workers,
-            output=output,
-            save_every=self.cfg.ssl_save_every,
-            print_every=self.cfg.ssl_print_every,
-        )
-        self.ssl_time = time.time() - t0
+            pretrainer = SSLPretrainer(
+                model=self.cfg.model,
+                aug_preset=self.cfg.ssl_aug_preset,
+                lambda_cl=self.cfg.ssl_lambda_cl,
+                lambda_rot=self.cfg.ssl_lambda_rot,
+                temperature=self.cfg.ssl_temperature,
+                imgsz=self.cfg.imgsz,
+                device=self.cfg.device,
+            )
+        else:
+            raise ConfigError(
+                f"Unknown ssl_method: {self.cfg.ssl_method!r}. "
+                f"Expected 'dense' or 'legacy'."
+            )
+
+        try:
+            t0 = time.time()
+            self.backbone_path = pretrainer.train(
+                images_dir=images_dir,
+                epochs=self.cfg.ssl_epochs,
+                batch_size=self.cfg.ssl_batch,
+                lr=self.cfg.ssl_lr,
+                warmup_epochs=self.cfg.ssl_warmup_epochs,
+                num_workers=self.cfg.ssl_num_workers,
+                output=output,
+                save_every=self.cfg.ssl_save_every,
+                print_every=self.cfg.ssl_print_every,
+            )
+            self.ssl_time = time.time() - t0
+        finally:
+            if hasattr(pretrainer, "cleanup"):
+                pretrainer.cleanup()
 
         _log(f"✅ SSL tamamlandı: {self.ssl_time:.1f}s → {self.backbone_path}")
         return self.backbone_path
