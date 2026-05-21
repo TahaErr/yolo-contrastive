@@ -9,11 +9,18 @@ Modules:
     coco_teacher    — frozen COCO YOLOv8x feature teacher + per-scale adapter
     teacher_cache   — FP16 npz feature cache I/O (§2.4)
     disagreement    — per-position cosine disagreement weighting (§10.29)
-    consensus_loss  — Form B / Form C distillation loss (planned)
+    consensus_loss  — Form B (learned weighted L2) + Form C (CWD dual KL) (§10.28)
 """
 
 from .coco_teacher import CocoTeacher
 from .teacher_cache import TeacherCache
 from .disagreement import DisagreementWeighter, cosine_disagreement
+from .consensus_loss import ConsensusLoss
 
-__all__ = ["CocoTeacher", "TeacherCache", "DisagreementWeighter", "cosine_disagreement"]
+__all__ = [
+    "CocoTeacher",
+    "TeacherCache",
+    "DisagreementWeighter",
+    "cosine_disagreement",
+    "ConsensusLoss",
+]
