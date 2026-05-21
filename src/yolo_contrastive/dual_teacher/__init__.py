@@ -7,11 +7,12 @@ weighting fuse the two signals.
 
 Modules:
     coco_teacher    — frozen COCO YOLOv8x feature teacher + per-scale adapter
-    teacher_cache   — feature cache I/O (planned)
+    teacher_cache   — FP16 npz feature cache I/O (§2.4)
     consensus_loss  — Form B / Form C distillation loss (planned)
     disagreement    — disagreement-based sample weighting (planned)
 """
 
 from .coco_teacher import CocoTeacher
+from .teacher_cache import TeacherCache
 
-__all__ = ["CocoTeacher"]
+__all__ = ["CocoTeacher", "TeacherCache"]
