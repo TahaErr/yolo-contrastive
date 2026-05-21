@@ -193,14 +193,15 @@ src/yolo_contrastive/
     run_matrix.py                     ✓ 34 test    — PretrainMatrix orchestrator
     dataset.py                        ✓             — UnlabeledImageDataset
     backbone_utils.py                 ✓             — save/load/freeze/unfreeze
-    dual_teacher_trainer.py           ⬜ YENİ (Faz 5.3) — DenseSSLPretrainer'ı sarmalar (composition, §10.30)
+    dual_teacher_trainer.py           ✅ TAMAMLANDI (42a74c4) — DenseSSLPretrainer'ı sarmalar (composition, §10.30)
 
-  dual_teacher/                       ⬜ YENİ (Faz 5.3 — paper'ın asıl yenisi)
-    __init__.py
-    coco_teacher.py                   ⬜ Frozen COCO YOLOv8x wrapper + size adapter (Risk 17)
-    teacher_cache.py                  ⬜ Feature cache I/O (parquet/npz)
-    consensus_loss.py                 ⬜ Form B (learned weighted L2) + Form C (dual KL)
-    disagreement.py                   ⬜ Yaklaşım D — exp(α_d · d) sample weighting
+  dual_teacher/                       ✅ TAMAMLANDI (Faz 5.3 — paper'ın asıl yenisi)
+    __init__.py                       ✅ 5 modül export
+    coco_teacher.py                   ✅ b31c79c — Frozen YOLO feature teacher + per-scale adapter (Risk 17), 17 test
+    teacher_cache.py                  ✅ 5edc0c1 — FP16 npz feature cache I/O (§2.4), 16 test
+    consensus_loss.py                 ✅ 381591e — Form B (learned weighted L2) + Form C (CWD dual KL), 22 test
+    disagreement.py                   ✅ 008c5e7 — per-position cosine disagreement weighting, 24 test
+    dual_teacher_trainer.py           ✅ 42a74c4 — DT-SAPS trainer (composition §10.30), 24 test
 
   finetune/
     trainer.py                        ✓ Risk 16 v2 fix devrede (§10.25)
@@ -611,7 +612,7 @@ Submission target: bkz. §9.
 | **17** | **COCO teacher feature size mismatch** (yeni) | YOLOv8x teacher (P3: 80×80×128 → P5: 20×20×512), YOLOv8n student (P3: 80×80×64 → P5: 20×20×256) — channel mismatch. Mitigasyon: per-scale linear adapter (frozen teacher feature → student channel count). Faz 5.3 başlangıcında implement. |
 | **18** | **Teacher cache disk space** (yeni) | 181K × 3-scale FP16 ≈ 360 GB. Mitigasyon: §2.4'te 3 alternatif (P5-only / subset cache / lokal NVMe). Stage 5.3.1 smoke sonrası karar. |
 | **19** | **Dual-teacher trainer karmaşıklığı** (yeni) | `DualTeacherTrainer` `DenseSSLPretrainer`'ı sarmalar (composition, §10.30). 3 loss bileşeni (SAPS + B + C + D), 5+ hyperparameter. Debugging zorluğu artar. Mitigasyon: per-component unit test (60-80 yeni test), invariant assertions (each loss term > 0, gradients flow, no aliasing — Risk 16 lesson). |
-| **20** | **Disagreement weighting (D) instability** (yeni) | `disagreement_weight = exp(α_d · d(f_coco, f_ssl))` — large α_d ile signal explosion riski. Mitigasyon: α_d ∈ {0, 0.5, 1.0, 2.0} ablation (Stage 5.3.2). α_d=0 default (D kapalı, fallback). Numerik koruma: `clamp(weight, max=10.0)`. |
+| **20** | **Disagreement weighting (D) instability** (yeni) | `disagreement_weight = exp(α_d · d(f_coco, f_ssl))` — large α_d ile signal explosion riski. Mitigasyon: α_d ∈ {-1.0, -0.5, 0, 0.5, 1.0, 2.0} ablation (Stage 5.3.2; negatif = consensus yönü, §10.29). Numerik koruma: `clamp(weight, max=10.0)` + α_d clamp `[-3, 3]`. |
 | **21** | **Multi-backbone batch_size scaling** (yeni) | YOLOv9n/v10n/v11n/v12n/v26n memory profileleri farklı. Aynı batch_size ile bazıları OOM yapabilir. Mitigasyon: Stage 5.2 başlangıcında her backbone için 1-epoch smoke ile batch_size auto-detect, sonra full run. |
 
 ---
@@ -844,15 +845,45 @@ B+C kombinasyon seçimi:
 3. **Ablation zenginliği:** α, β, w_init, scale (B-only vs C-only vs B+C) — paper'ın yarısı bu ablation'dan çıkar.
 4. **Implementation maliyeti hafif** — birkaç loss term, mevcut framework'e fits.
 
-### 10.29 Disagreement weighting hard-mining mechanism (v9 yeni)
+### 10.29 Disagreement weighting mechanism (v9 yeni — implementasyonda genişletildi)
 
-Yaklaşım D (`L_distill *= exp(α_d · d(f_coco, f_ssl))`) iki teacher'ın **uyuşmadığı sample'larda** signal'i artırır. α_d=0 klasik (D kapalı), α_d→∞ çok agresif hard mining.
+Yaklaşım D (`L_distill *= exp(α_d · d(f_coco, f_ssl))`) iki teacher'ın uyuşma/uyuşmazlık derecesine göre per-position signal'i modüle eder.
 
-**Sezgi:** Easy examples'da iki teacher consensus'a varır (signal düşük zaten redundant). Hard examples'da uyuşmaz (signal yüksek — burada öğrenecek bir şey var). Hard mining'in dual-teacher versiyonu.
+**İmplementasyon kararları (web literatür taraması ile, modül 3 `disagreement.py`):**
 
-**Risk 20 — instability:** `exp(α_d · d)` patlayabilir. Mitigasyon: `clamp(weight, max=10.0)`, α_d ablation ile optimal değer.
+- **Metrik = per-position cosine distance** `d = 1 - cos(f_coco, f_ssl)`, kanal ekseninde → `[B,H,W]`. Feature distillation literatürü L2 yerine cosine tercih ediyor (CSKD, ReviewAT); ölçek-bağımsız, iki teacher'ın magnitude farkını değil semantik yön farkını ölçer. Detection KD'de spatial (per-position) weighting standardı (FGD/SAMKD/CSKD).
 
-**Akademik value:** Bu CoMAD'ın "consensus gating" mekanizmasından **ters yön** — CoMAD uyumsuzluğu filtreler, biz vurgularız. Bu fark paper'ın "vs CoMAD" defansının kalbi.
+- **α_d işaret-agnostik — yön ablation'a bırakıldı.** Literatür bölünmüş: UEKD uyuşmazlığı *vurgular* (hard-mining), PAD hard-mining'in KD'de *zararlı* olduğunu deneysel gösterir. Tek formül her ikisini kapsar: α_d>0 uyuşmazlığı vurgular (UEKD/hard-mining), α_d=0 uniform (klasik), **α_d<0 uzlaşıyı vurgular (PAD/CoMAD consensus yönü)**. Hangi yönün traffic detection'da COCO'yu geçtiğine ablation karar verir.
+
+- **AblATION EKSENİ GÜNCELLENDİ:** α_d ∈ {0, 0.5, 1.0, 2.0} → **α_d ∈ {-1.0, -0.5, 0, 0.5, 1.0, 2.0}** (negatif değerler consensus yönünü test eder). Risk 20 tablosu da bu eksene göre güncellendi.
+
+**İki özgün katkı (literatürde yok — paper contribution):**
+1. **Öğrenilebilir α_d** — sabit hyperparameter yerine `nn.Parameter`; model eğitimde uyuşmazlığa ne kadar ağırlık vereceğini kendisi öğrenir. α_d-vs-epoch trajektörü paper Figure; negatife yakınsama PAD'i, pozitife UEKD'yi deneysel doğrular.
+2. **Per-scale α_d** — FPN seviyesi başına ayrı α_d (P3/P4/P5). Uzak küçük nesneler vs büyük yüzeyler için uyuşmazlık farklı işlev görebilir — weighter scale-aware, SAPS çekirdeğiyle tutarlı.
+
+2×2 ablation alt-ekseni: `disagreement_mode ∈ {fixed, learnable}` × `per_scale ∈ {shared, per_scale}`. `fixed-shared` literatürün ayarı, `learnable-per_scale` bu paper'ın genişletmesi.
+
+**Risk 20 — instability:** `exp(α_d · d)` patlayabilir. Mitigasyon: `clamp(weight, max=10.0)` + α_d clamp `[-3, 3]`.
+
+**Akademik value:** Bu CoMAD'ın "consensus gating" mekanizmasından farklı — CoMAD uyumsuzluğu sabit şekilde filtreler; biz α_d işaretiyle yönü ablation'a bırakırız. Paper'ın "vs CoMAD" defansının kalbi.
+
+### 10.31 DT-SAPS modül implementasyon kararları (v9 yeni — Faz 5.3 build)
+
+`dual_teacher/` paketi 5 modül halinde inşa edildi (commit zinciri b31c79c..42a74c4, 103 yeni test, tam suite 952). Plana yazılı olmayan, web literatür taraması ile verilen implementasyon kararları:
+
+1. **CocoTeacher adapter trainable.** Teacher backbone frozen, ama teacher→student kanal projeksiyonu (Risk 17 adapter) öğrenilebilir. Random frozen projeksiyon distillation sinyalini bozar; alignment öğrenilecek bir şeydir (linear-probe deseni). Cache ham (un-adapted) feature tutar — adapter eğitimde değişir.
+
+2. **Form C = CWD channel-wise KL.** Dense feature map'te logit yok; CWD (Channel-wise KD, Shu et al. 2021) her kanalın H×W haritasını spatial softmax ile dağılıma çevirir. Dense prediction'da SOTA; softmax magnitude-scale farkını siler (teacher-teacher). T² ölçekleme.
+
+3. **Form C dual KL ayrı, füzyonsuz.** `KL(s‖coco) + KL(s‖ssl)` — Form B (feature-space füzyon, w-ağırlıklı) ile Form C (logit-space dual) gerçek anlamda farklı mekanizmalar; B/C/B+C ablation ayrımı anlamlı kalır.
+
+4. **SSL teacher = ayrı frozen pretrained backbone (Faz 5.1 SAPS winner), COCO ile simetrik.** Momentum encoder DEĞİL — o student'ın EMA'sı, bağımsız teacher değil; 'dual-teacher' + 'supervised+SSL hybrid' iddiası (§14.1, vs CoMAD) ancak ayrı frozen SSL teacher ile tutar. Bootstrap: SAPS pretrain → winner → DT-SAPS'ın SSL teacher'ı. SSL teacher YOLOv8n = student mimarisi → adapter gerekmez (Risk 17 sadece COCO YOLOv8x için).
+
+5. **İki teacher feature modu.** Cache modu (TeacherCache, Faz 5.3 gerçek run 181K img × ~60 cell) ve canlı mod (frozen teacher forward, smoke/test). DualTeacherTrainer her ikisini de destekler; COCO adapter her iki modda uygulanır.
+
+6. **teacher_combo tek kod yolu.** `none/coco_only/ssl_only/both` — tek-teacher combolarda ConsensusLoss'un iki teacher slotu aynı feature'ı alır (Form B target tek teacher'a iner, disagreement self-comparison → no-op). Ayrı kod yolu gerekmez.
+
+---
 
 ### 10.30 Composition over inheritance for trainer extension (v9 yeni — Karar K5)
 
