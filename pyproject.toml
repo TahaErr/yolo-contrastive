@@ -21,7 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 yolo     = ["ultralytics>=8.0.0"]
-pretrain = ["opencv-python>=4.6.0"]
+pretrain = ["opencv-python>=4.6.0", "imagehash>=4.3.0", "pandas>=2.0.0", "pyarrow>=12.0.0"]
 dev      = ["pytest", "ruff", "pre-commit"]
 all      = ["yolo-contrastive[yolo,pretrain,dev]"]
 
@@ -38,6 +38,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow — real model training (deselect with -m 'not slow')",
+]
 
 [tool.ruff]
 target-version = "py310"
