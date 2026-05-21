@@ -477,3 +477,34 @@ class TestCleanup:
         probe = _make_probe()
         probe.cleanup()
         probe.cleanup()  # no error
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# train() alias (UX-4 — library-wide consistent entry point)
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class TestTrainAlias:
+    """LinearProbeTrainer.train is an alias for fit — so every trainer in the
+    library shares the same train(...) entry point."""
+
+    def test_train_alias_exists(self):
+        probe = _make_probe(num_classes=3)
+        try:
+            assert hasattr(probe, "train")
+            assert callable(probe.train)
+        finally:
+            probe.cleanup()
+
+    def test_train_delegates_to_fit(self):
+        """train(...) produces the same result keys as fit(...)."""
+        probe = _make_probe(num_classes=3)
+        try:
+            ds = _RandomMultiLabelDataset(n=8, num_classes=3, imgsz=32, seed=0)
+            result = probe.train(_loader(ds), _loader(ds),
+                                 epochs=2, verbose=False)
+            assert "best_val_mAP" in result
+            assert "history" in result
+            assert len(result["history"]) == 2
+        finally:
+            probe.cleanup()

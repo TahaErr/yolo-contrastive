@@ -342,6 +342,16 @@ class LinearProbeTrainer:
 
     # ── public training API ─────────────────────────────────────────────
 
+    def train(self, *args, **kwargs) -> Dict[str, Any]:
+        """Alias for :meth:`fit` — library-wide consistent entry point.
+
+        Every trainer in yolo-contrastive exposes ``train(...)``; this alias
+        lets ``LinearProbeTrainer`` be driven the same way. ``fit`` is kept
+        as the primary name (scikit-learn convention for a classification
+        probe); both share one implementation.
+        """
+        return self.fit(*args, **kwargs)
+
     def fit(
         self,
         train_loader: DataLoader,
