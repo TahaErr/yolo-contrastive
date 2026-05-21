@@ -1,195 +1,159 @@
 # yolo-contrastive
 
-> Contrastive learning + multi-task self-supervised pretraining for Ultralytics YOLOv8+
+> Self-supervised pretraining + dual-teacher distillation for Ultralytics YOLOv8+
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
 
-## Features
+A research library for pretraining YOLO detection backbones on **unlabeled**
+traffic-scene images, then transferring to downstream detection with few
+labels. Its centerpiece is **DT-SAPS** — Scale-Aware Dense Contrastive
+Pretraining with Dual-Teacher Distillation — which augments dense
+self-supervised pretraining with knowledge distilled from a supervised
+(COCO) teacher and a self-supervised teacher.
 
-- **Drop-in trainer** — subclasses Ultralytics `DetectionTrainer`
-- **Auto feature tap** — automatically selects the best backbone layer
-- **NT-Xent loss** (InfoNCE / SimCLR) with configurable temperature
-- **Multi-task pretext system** — 6 pluggable pretext tasks with composite training
-- **FrequencyBandPrediction** — novel frequency domain pretext task (first in image SSL for detection)
-- **SSL pretraining** — pretrain on unlabeled images, fine-tune with labels
-- **Pluggable augmentations** — registry-based, preset pipelines (simclr_v1/v2, byol, aggressive)
-- **Fine-tuning** — differential LR, layer freezing, pretrained backbone support
-- **CSV logging** — per-step loss tracking
+## Highlights
 
-## Pretext Task System
-
-The library provides a registry-based pretext task system inspired by IE-Rot (Yamaguchi et al. 2019) and extended with novel contributions. Tasks can be used individually or combined via `CompositeTask` for multi-task SSL.
-
-### Available Tasks
-
-| Task | Classes | What it learns | Difficulty |
-|---|---|---|---|
-| `rotation` | 4 | Shape/orientation (0°/90°/180°/270°) | Trivial for pretrained |
-| `solarization` | 4 | Color/brightness texture | Medium |
-| `color_perm` | 6 | Color-object relationships (RGB permutations) | Hard |
-| `patch_shuffle` | 24 | Spatial coherence (2×2 jigsaw) | Hard |
-| `blur` | 4 | Frequency/detail level (Gaussian blur) | Medium |
-| `freq_band` | 4 | Frequency structure (FFT band masking) | Hard |
-
-### FrequencyBandPrediction (Novel Contribution)
-
-Frequency domain pretext tasks have been used in time series SSL (TF-C, TRLS, FreMixer) but **this is the first application to image SSL for object detection**.
-
-The task applies 2D FFT to the image, masks a random frequency band, and reconstructs via IFFT. The model predicts which band was removed:
-
-- **Low frequency removed** → shape/contour information lost
-- **Mid frequency removed** → texture/pattern information lost
-- **High frequency removed** → edge/fine detail information lost
-
-Pipeline: `img → FFT2D → band mask (smooth sigmoid) → IFFT2D → predict`
-
-### Recommended Combination
-
-The following combination covers three orthogonal feature axes and provides a non-trivial learning signal even for pretrained backbones:
-```python
-from yolo_contrastive.pretext import CompositeTask
-
-composite = CompositeTask.from_names(
-    ["freq_band", "solarization", "patch_shuffle"],
-    feat_dim=256,
-    weights=[1.0, 0.8, 0.5],
-)
-# freq_band    → frequency structure (shape/texture/edge)
-# solarization → color/brightness texture
-# patch_shuffle → spatial coherence
-```
+- **DT-SAPS dual-teacher framework** — dense SAPS pretraining + distillation
+  from a frozen COCO teacher and a frozen SSL teacher, fused via consensus
+  and per-position disagreement weighting.
+- **Dense SAPS pretraining** — scale-aware, per-position contrastive
+  pretraining over P3/P4/P5 feature maps (not global-pooled).
+- **External SSL baselines** — SimCLR-YOLO, MoCo-v3-YOLO, CoMAD-YOLO, ready
+  for fair "vs SOTA" comparison.
+- **Evaluation tooling** — frozen-backbone linear probe, YAML-driven ablation
+  grids, and cross-set leakage checking.
+- **Drop-in fine-tuning** — load a pretrained backbone into a YOLO
+  fine-tuning trainer with differential LR and layer freezing.
 
 ## Installation
+
 ```bash
-git clone https://github.com/TahaErr/yolo-contrastive.git
-cd yolo-contrastive
-pip install -e ".[yolo,dev]"
+pip install -e ".[all]"        # everything (yolo + pretrain + dev extras)
 ```
 
-## Quick Start
+Granular extras: `yolo` (ultralytics), `pretrain` (opencv, imagehash),
+`dev` (pytest, ruff). `torch` and `pyyaml` are hard dependencies.
 
-### Contrastive Training (with labels)
+The top-level package imports lazily — `import yolo_contrastive` is
+lightweight and does not require ultralytics; a class is only loaded on
+first use.
+
+## Quick start
+
+### Dense SAPS pretraining
+
 ```python
-import os
-os.environ["YCL_LAMBDA"] = "0.1"
-os.environ["YCL_TEMP"] = "0.2"
+from yolo_contrastive import DenseSSLPretrainer
 
-from ultralytics import YOLO
-from yolo_contrastive.trainer import ContrastiveDetectionTrainer
-
-model = YOLO("yolov8n.pt")
-model.train(data="coco128.yaml", epochs=10, trainer=ContrastiveDetectionTrainer)
-```
-
-### Multi-Task Pretext Training (with labels)
-```python
-import os
-os.environ["YCL_LAMBDA"] = "0.1"
-os.environ["YCL_PRETEXT_TASKS"] = "freq_band,solarization,patch_shuffle"
-os.environ["YCL_PRETEXT_WEIGHTS"] = "1.0,0.8,0.5"
-os.environ["YCL_LAMBDA_PRETEXT"] = "0.3"
-
-from ultralytics import YOLO
-from yolo_contrastive.trainer import ContrastiveDetectionTrainer
-
-model = YOLO("yolov8n.pt")
-model.train(data="coco128.yaml", epochs=10, trainer=ContrastiveDetectionTrainer)
-```
-
-### SSL Pretraining (without labels)
-```python
-from yolo_contrastive.pretrain import SSLPretrainer
-
-# Multi-task pretext (recommended)
-pretrainer = SSLPretrainer(
-    model="yolov8n.pt",
-    aug_preset="simclr_v2",
-    lambda_cl=1.0,
-    pretext_tasks=["freq_band", "solarization", "patch_shuffle"],
-    pretext_weights=[1.0, 0.8, 0.5],
-    lambda_pretext=0.5,
+trainer = DenseSSLPretrainer(model="yolov8n.pt", imgsz=640)
+backbone_path = trainer.train(
+    images_dir="/data/unlabeled_pool",
+    epochs=100, batch_size=32,
+    output="saps_backbone.pt",
 )
-pretrainer.train(images_dir="path/to/images", epochs=100, output="backbone.pt")
-
-# Legacy rotation (backward compatible)
-pretrainer = SSLPretrainer(
-    model="yolov8n.pt",
-    aug_preset="simclr_v2",
-    lambda_cl=1.0,
-    lambda_rot=0.5,
-)
-pretrainer.train(images_dir="path/to/images", epochs=100, output="backbone.pt")
+trainer.cleanup()
 ```
 
-### Fine-tuning with Pretrained Backbone
-```python
-import os
-os.environ["YCL_PRETRAINED"] = "backbone.pt"
-os.environ["YCL_FREEZE_BACKBONE"] = "10"
-os.environ["YCL_UNFREEZE_EPOCH"] = "5"
+### DT-SAPS dual-teacher pretraining
 
+```python
+from yolo_contrastive import DualTeacherTrainer, CocoTeacher
+
+# COCO teacher — frozen YOLOv8x backbone, per-scale adapter to student channels
+coco_teacher = CocoTeacher(
+    weights="yolov8x.pt",
+    student_channels={"P3": 64, "P4": 128, "P5": 256},
+)
+# SSL teacher — the pure-SAPS pretraining winner (student architecture)
+ssl_teacher = CocoTeacher(weights="saps_backbone.pt")
+
+trainer = DualTeacherTrainer(
+    model="yolov8n.pt",
+    teacher_combo="both",          # none | coco_only | ssl_only | both
+    coco_teacher=coco_teacher,
+    ssl_teacher=ssl_teacher,
+    distill_form="B+C",            # B | C | B+C
+    imgsz=640,
+)
+backbone_path = trainer.train(images_dir="/data/unlabeled_pool", epochs=100)
+trainer.cleanup()
+```
+
+### Fine-tuning with a pretrained backbone
+
+```python
+from yolo_contrastive import load_backbone
 from ultralytics import YOLO
-from yolo_contrastive.finetune import FinetuneDetectionTrainer
 
 model = YOLO("yolov8n.pt")
-model.train(data="dataset.yaml", epochs=50, trainer=FinetuneDetectionTrainer)
+load_backbone(model.model, "saps_backbone.pt", backbone_only=True)
+model.train(data="dataset.yaml", epochs=50)
 ```
 
-## Configuration
+### Linear probe evaluation
 
-### Contrastive Learning
+```python
+from yolo_contrastive import LinearProbeTrainer
 
-| Env Var | Default | Description |
-|---|---|---|
-| `YCL_LAMBDA` | `0.0` | CL loss weight (0=disabled) |
-| `YCL_LOSS` | `ntxent` | Loss: `ntxent`/`infonce`/`simclr` |
-| `YCL_TEMP` | `0.2` | NT-Xent temperature |
-| `YCL_TWO_VIEW` | `0` | Real two-view augmentation |
-| `YCL_AUG_PRESET` | `` | Preset: `simclr_v1`, `simclr_v2`, `byol`, `aggressive` |
-
-### Multi-Task Pretext
-
-| Env Var | Default | Description |
-|---|---|---|
-| `YCL_PRETEXT_TASKS` | `` | Comma-separated task names (e.g. `freq_band,solarization,blur`) |
-| `YCL_PRETEXT_WEIGHTS` | `` | Per-task loss weights (e.g. `1.0,0.8,0.5`), defaults to all 1.0 |
-| `YCL_LAMBDA_PRETEXT` | `0.0` | Total pretext loss multiplier |
-| `YCL_LAMBDA_ROT` | `0.0` | Legacy rotation-only weight (backward compat) |
-
-### Fine-tuning
-
-| Env Var | Default | Description |
-|---|---|---|
-| `YCL_PRETRAINED` | `` | Pretrained backbone path |
-| `YCL_FREEZE_BACKBONE` | `10` | Layers to freeze |
-| `YCL_UNFREEZE_EPOCH` | `0` | Epoch to unfreeze (0=never) |
-| `YCL_BACKBONE_LR_SCALE` | `0.1` | Backbone LR multiplier |
-
-### Loss Formula
-```
-total = det_loss + λ_cl × cl_loss + λ_pretext × Σ(wᵢ × taskᵢ_loss)
+probe = LinearProbeTrainer(
+    backbone="yolov8n.pt",
+    backbone_ckpt="saps_backbone.pt",
+    num_classes=4,
+)
+result = probe.train(train_loader, val_loader, epochs=10)   # train() or fit()
+print(result["best_val_mAP"])
+probe.cleanup()
 ```
 
-## Architecture
+### Cross-set leakage check
+
+The SSL pretrain pool must not overlap downstream evaluation data:
+
+```bash
+python -m yolo_contrastive.eval.leakage_check \
+    --pool-phash pool_phash.parquet \
+    --downstream /data/eval/train /data/eval/valid \
+    --hamming-threshold 5
 ```
-┌──────────────────────────────────────────────────┐
-│                  Input Image                      │
-├────────────┬─────────────────┬───────────────────┤
-│            │                 │                    │
-│    Detection Path     CL Path          Pretext Path
-│    (YOLO head)     (NT-Xent)      (CompositeTask)
-│            │                 │                    │
-│         det_loss         cl_loss    ┌────────────┤
-│            │                 │      │  freq_band │
-│            │                 │      │  solarize  │
-│            │                 │      │  patch_shuf│
-│            │                 │      └────────────┤
-│            │                 │       pretext_loss │
-├────────────┴─────────────────┴───────────────────┤
-│  total = det + λ_cl·cl + λ_pretext·Σ(wᵢ·taskᵢ) │
-└──────────────────────────────────────────────────┘
+
+## Package layout
+
+| Package | What it provides |
+|---|---|
+| `pretrain/` | `DenseSSLPretrainer`, `SSLPretrainer`, backbone I/O |
+| `dual_teacher/` | DT-SAPS — `DualTeacherTrainer`, `CocoTeacher`, `TeacherCache`, `ConsensusLoss`, `DisagreementWeighter` |
+| `baselines/` | `SimCLRYOLOTrainer`, `MoCoV3YOLOTrainer`, `CoMADYOLOTrainer` |
+| `dense/` | dense primitives — feature tap, momentum encoder, multi-scale loss |
+| `eval/` | `LinearProbeTrainer`, `RunMatrix`, leakage check |
+| `finetune/` | `FinetuneDetectionTrainer` — YOLO fine-tuning with pretrained backbone |
+| `data/` | SSL pool ingestion, deduplication, downstream loaders |
+| `contrastive/`, `augmentations/` | NT-Xent loss, augmentation presets |
+
+Runnable examples live in [`examples/`](examples/).
+
+## Trainer conventions
+
+Every trainer follows the same shape: a constructor, a `train(...)` method
+returning the saved backbone path, and a `cleanup()` that releases feature-tap
+hooks. `LinearProbeTrainer` additionally exposes `fit(...)` (the scikit-learn
+name) — `train` and `fit` are equivalent there.
+
+## Testing
+
+```bash
+pytest                    # full suite
+pytest -m "not slow"      # skip the real-YOLO end-to-end tests
 ```
+
+## Legacy modules
+
+Earlier versions centered on a registry-based **pretext-task system**
+(rotation, solarization, color permutation, jigsaw) and a **composite
+multi-task** trainer, plus an experimental `FrequencyBandPrediction`
+frequency-domain pretext task. These modules remain in the codebase for
+reproducibility but are not part of the DT-SAPS pipeline; the
+frequency-domain pretext task is deferred to a separate follow-up study.
 
 ## License
 
