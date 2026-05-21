@@ -928,6 +928,38 @@ class DualTeacherTrainer:
 - **Code clarity:** Distillation logic ayrı dosya, ayrı test suite (60-80 yeni test).
 - **Future-proof:** Distillation framework değişikliği SSL trainer'ı etkilemez.
 
+
+### 10.33 Gerçek-run bug avı — mock testing kör noktaları (v9 yeni — paper supplementary'sinde lesson)
+
+Kütüphane kullanılabilirlik audit'i + tam repo bug avı sırasında, 1019 yeşil birim/integration testine rağmen 2 gizli bug yalnızca **gerçek-run testing** ile tespit edildi. Her iki bug da aynı kök desende — bu bölüm o deseni methodological lesson olarak kaydeder.
+
+**Bulunan 2 bug:**
+
+| Bug | Modül | Kök sebep |
+|---|---|---|
+| CocoTeacher SSL checkpoint yükleyemiyor | dual_teacher | String weight `YOLO(weights).model` ile yükleniyordu; SAPS checkpoint `{model_state_dict}` formatında, `model` anahtarı yok → `KeyError` |
+| `mocov3_v3_v2` / `dino_v1` preset'leri eksik | augmentations | Plan §5.3 bu preset isimlerine atıfta bulunuyor, `presets.py` sağlamıyordu → Faz 5.3'te `build_pipeline` `KeyError` verecekti |
+
+**Ortak kök desen — mock testing kör noktası:**
+
+Her iki modülün de birim testleri vardı ve geçiyordu. Ama:
+- CocoTeacher testleri `weights=` parametresine **nn.Module** (mock encoder) veriyordu — gerçek kullanım yolu (string SSL-checkpoint path) hiç test edilmemişti.
+- Augmentation preset testleri yalnızca **var olan** preset'leri parametrize ediyordu — plan'ın atıfta bulunduğu ama eksik isimler test kapsamı dışındaydı.
+
+İki durumda da test "modül çalışıyor" diyordu, ama "kullanıcının/planın gerçekte varsayacağı yol çalışıyor" demiyordu.
+
+**§10.25 ile ilişki — genelleme:**
+
+§10.25 şunu kaydetmişti: bir fix'in unit testi bug pattern'ını reprodüce edebilir, ama fix'in yan etkilerini production flow'da test etmeden deploy etmek tehlikeli. §10.33 bunun kardeş dersi: bir feature'ın unit testi feature'ı **izole** doğrulayabilir, ama gerçek kullanım yolunu (gerçek girdi formatı, gerçek dosya, gerçek API tüketicisi) test etmeden "kapsanmış" saymak tehlikeli. Her ikisi de "mock/izole test ≠ entegre/gerçek test" prensibinin iki yüzü.
+
+**Uygulanan metodoloji — gerçek-run bug avı:**
+
+Tüm repo, gerçek YOLOv8n + gerçek dummy veri ile sistematik tarandı: DT-SAPS framework, baselines, `run_matrix` orchestrator'ları (grid/CSV/resume/exclude), `ssl_pool` ingestion, `dedup` pHash, ve kütüphanenin ilk dönem SSL hattı — `SSLPretrainer` 3 modu (CompositeTask / legacy rotation / saf CL), her pretext task tek tek (`FrequencyBandPrediction` dahil), `ContrastiveDetectionTrainer` gerçek YOLO `train()` döngüsü. Mock'un göremediği iki bug bu taramada çıktı; geri kalan tüm yüzey temiz doğrulandı.
+
+**Paper-worthy lesson:** Test sayısı metriği (1019 test) modül-içi correctness'i ölçer ama API-tüketim yollarını ve plan-kod tutarlılığını ölçmez. Engineering rigor için: (a) feature testleri **gerçek girdi formatlarını** kapsamalı (mock nesneler değil), (b) plan dokümanının atıfta bulunduğu her API ismi koda karşı doğrulanmalı (plan-kod drift kontrolü), (c) release öncesi gerçek-run smoke — kullanıcının gerçekte koşturacağı yollar — birim test paketini tamamlar.
+
+Her iki bug'ın kör noktası teste bağlandı: CocoTeacher'a `TestSSLCheckpointLoading` (gerçek SSL-checkpoint yükleme), `test_augmentations.py` parametrize 6 preset.
+
 ---
 
 ## 11. Architecture Sentinels
