@@ -212,12 +212,13 @@ src/yolo_contrastive/
     run_matrix.py                     ⚠️  26 test (linear_probe runner OK)
                                       ⚠️  _run_detection STUB (raises NotImplementedError)
                                       §13.7'de Faz 5.1.1 öncesi implement edilecek
-    leakage_check.py                  ⬜ Faz 4.2 (pHash modülü hazır, CLI runner şart)
+    leakage_check.py                  ✅ 502b069 — pool/downstream cross-set leakage CLI runner, 14 test
 
-  baselines/                          ⬜ Faz 5.4 (Faz 3'ten taşındı)
-    comad_yolo.py                     ⬜ CoMAD-YOLO port (multi-SSL teacher consensus)
-    simclr_yolo.py                    ⬜ SimCLR-YOLO (global pooling baseline, 2025 reference)
-    moco_v3.py                        ⬜ MoCo-v3 port
+  baselines/                          ✅ TAMAMLANDI (Faz 5.4 — external SSL baseline portları)
+    __init__.py                       ✅ 3 trainer export
+    comad_yolo.py                     ✅ b2d2ae9 — CoMAD-YOLO (3 SSL teacher consensus gating + asymmetric masking), 17 test
+    simclr_yolo.py                    ✅ 1c5299c — SimCLR-YOLO (in-batch NT-Xent, global-pooled), 13 test
+    moco_v3.py                        ✅ 6211133 — MoCo-v3-YOLO (momentum + predictor, no queue), 15 test
 
   data/                               ✅ KAPSAMLI
     label_fraction.py                 ✓ 30 test    — fraction splits
@@ -885,6 +886,26 @@ Yaklaşım D (`L_distill *= exp(α_d · d(f_coco, f_ssl))`) iki teacher'ın uyu�
 
 ---
 
+### 10.32 External baseline port kararları (v9 yeni — Faz 5.4 build)
+
+`baselines/` paketi 3 modül halinde inşa edildi (commit 1c5299c..b2d2ae9, 45 yeni test). Sadakat seviyesi kararı ve modül kararları:
+
+**Sadakat seviyesi — çekirdek-mekanizma fair baseline.** Her baseline, bilinen bir SSL yönteminin ayırt edici mekanizmasını YOLOv8n backbone + aynı pool + aynı protokol ile uygular — orijinal kod tabanının birebir portu değil. Gerekçe: CoMAD ViT/ImageNet/classification, biz CNN/traffic/detection — birebir port zaten mimari olarak imkânsız; "X-YOLO" baseline'ları için literatürdeki standart pratik, X'in prensibini yeni backbone'a uygulamaktır.
+
+**Modül kararları:**
+
+1. **SimCLR-YOLO** — SimCLR çekirdeği: tek encoder, momentum/queue yok, iki view, global-pooled embedding, in-batch NT-Xent. Mevcut `NTXentLoss` + `ProjectionHead` yeniden kullanıldı.
+
+2. **MoCo-v3-YOLO** — MoCo-v3 çekirdeği (MoCo-v2 farkıyla): momentum encoder + query-only prediction head (asimetrik), queue YOK, symmetric InfoNCE. `2τ` ölçekleme MoCo-v3 official'e sadık.
+
+3. **CoMAD-YOLO** — CoMAD çekirdeği: 3 SSL teacher (repo'nun SimCLR/MoCo-v3/dense-SAPS backbone'ları — CoMAD'ın MAE+MoCo+iBOT diversity'sine analog), asymmetric masking (student yüksek-oran, teacher'lar hafif/farklı), joint consensus gating (parameter-free, per-position gate = cosine affinity × inter-teacher agreement), CWD channel-wise KL.
+
+4. **CoMAD-YOLO bilinçli olarak tek-scale (P5).** Multi-scale + scale-aware reweighting DT-SAPS'ın kendi 4-axis novelty eksenlerinden biri (§14.1); baseline'a verilmedi. CoMAD da ViT olarak tek-scale — hem CoMAD'a sadık hem bizim ekseni korur.
+
+5. **Baseline'lar `dual_teacher`'dan bağımsız.** Kavramsal ayrım: baseline'lar bizim yöntemimizi import etmez. CWD-KL ve cosine helper'ları her baseline kendi içinde tutar (küçük duplikasyon kabul — paket bağımsızlığı için).
+
+---
+
 ### 10.30 Composition over inheritance for trainer extension (v9 yeni — Karar K5)
 
 `DualTeacherTrainer` `DenseSSLPretrainer`'dan **inherit etmiyor**, onu **member** olarak tutuyor (composition).
@@ -1031,7 +1052,7 @@ Kanıtlar:
 | 5.1.3 Fine | ⬜ YAML template hazır | Önkoşul: 5.1.2 winner + pool→local copy |
 | 5.2 Multi-backbone | ⬜ YAML yapılacak | Önkoşul: 5.1.3 winner |
 | 5.3 DT-SAPS | ⬜ Modüller yazılacak | Önkoşul: 5.1.3 winner + teacher cache |
-| 5.4 External baselines | ⬜ Portlar yapılacak | Önkoşul: DT-SAPS yapılırken paralel |
+| 5.4 External baselines | ✅ Portlar yazıldı (b2d2ae9) | 3 trainer: CoMAD/SimCLR/MoCo-v3-YOLO, 45 test. Eğitim Faz 5.4 run'da |
 | 5.5 DINOv2 reference | ⬜ Hazır kalır | Önkoşul: DT-SAPS winner |
 | 5.6 Paper writing | ⬜ | Önkoşul: tüm sonuçlar |
 
@@ -1085,7 +1106,7 @@ Akademik şeffaflık: proje boyunca bilerek atlanan veya başlandı-bitirilmedi 
 
 ### 13.3 Cross-set leakage check (pool ↔ downstream)
 
-**Status:** pHash modülünün `leakage_check` fonksiyonu var, gerçek karşılaştırma yapılmadı.
+**Status:** `eval/leakage_check.py` CLI runner yazıldı (commit `502b069`, 14 test) — pool↔downstream cross-set leakage. Gerçek karşılaştırma pool lokalken yapılacak (§13.1/13.2 önkoşul).
 
 **Yapılacak:**
 1. SSL pool hash'leri (§13.1'in çıktısı)
