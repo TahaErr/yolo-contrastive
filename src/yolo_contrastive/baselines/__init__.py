@@ -6,8 +6,10 @@ Table 4 "DT-SAPS vs SOTA" comparison.
 
 Modules:
     simclr_yolo  — SimCLR (in-batch NT-Xent, global-pooled, no momentum/queue)
+    moco_v3      — MoCo-v3 (momentum encoder + predictor, no queue, symmetric InfoNCE)
 """
 
 from .simclr_yolo import SimCLRYOLOTrainer
+from .moco_v3 import MoCoV3YOLOTrainer
 
-__all__ = ["SimCLRYOLOTrainer"]
+__all__ = ["SimCLRYOLOTrainer", "MoCoV3YOLOTrainer"]
