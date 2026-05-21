@@ -391,23 +391,28 @@ class TestC15_TopLevelAPI:
 # ═════════════════════════════════════════════════════════════════════════
 
 
-class TestC16_ModernHatExportSentinel:
-    """WORK_PLAN_v9 §11.11 sentinel — the modern dense hat (DenseSSLPretrainer,
-    dense.*) is intentionally NOT exported from the top-level package.
+class TestC16_ModernHatTopLevelExport:
+    """UX-1 (top-level lazy __init__.py) — the modern framework
+    (DenseSSLPretrainer, DualTeacherTrainer, baselines, ...) IS exported
+    from the top-level package via PEP 562 lazy __getattr__.
 
-    If the §13.8 pipeline rewire later promotes the modern hat to the top
-    level, THIS TEST FAILS ON PURPOSE — forcing a conscious __all__ update
-    rather than a silent surface change."""
+    This replaces the WORK_PLAN_v9 §11.11 "absent" sentinel: the modern
+    hat was intentionally promoted to the top level so the paper framework
+    is reachable as ``from yolo_contrastive import DualTeacherTrainer``."""
 
-    def test_modern_hat_absent_from_top_level(self):
+    def test_modern_hat_present_at_top_level(self):
         import yolo_contrastive
 
-        # Sentinel: these are NOT on the top-level namespace today.
-        for modern_sym in ("DenseSSLPretrainer", "MultiScaleFeatureTap",
-                            "PretrainMatrix", "RunMatrix"):
-            assert not hasattr(yolo_contrastive, modern_sym), (
-                f"§11.11 sentinel tripped: '{modern_sym}' is now exported at "
-                f"top level. If intentional, update __all__ + this test."
+        # The modern framework IS on the top-level namespace now.
+        for modern_sym in ("DenseSSLPretrainer", "DualTeacherTrainer",
+                            "SimCLRYOLOTrainer", "RunMatrix"):
+            assert hasattr(yolo_contrastive, modern_sym), (
+                f"UX-1 regression: '{modern_sym}' is no longer exported "
+                f"at top level. It must be reachable via "
+                f"`from yolo_contrastive import {modern_sym}`."
+            )
+            assert modern_sym in yolo_contrastive.__all__, (
+                f"'{modern_sym}' missing from __all__"
             )
 
     def test_modern_hat_reachable_via_submodule(self):
