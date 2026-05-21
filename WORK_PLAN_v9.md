@@ -1081,19 +1081,13 @@ Akademik şeffaflık: proje boyunca bilerek atlanan veya başlandı-bitirilmedi 
 
 **Karar:** Pothole 5K **bloklayıcı değil**, bonus. Faz 5.6 öncesi hazırsa eklenir, değilse 4-class ile devam.
 
-### 13.5 imagehash kütüphane install (operasyonel)
+### 13.5 imagehash kütüphane install (operasyonel) ✅ KALICI ÇÖZÜM (commit `d3910a7`)
 
-Her Colab session başlatıldığında manuel:
-```bash
-pip install imagehash
-```
+**Status:** ✅ ÇÖZÜLDÜ. `imagehash` (+ `pandas`, `pyarrow`) `pyproject.toml` `[project.optional-dependencies]` `pretrain` grubuna pinlendi (commit `d3910a7`). Artık `pip install -e ".[pretrain]"` hepsini kalıcı çeker — Colab session reset sonrası manuel kurulum gerekmez.
 
-Vast.ai instance'larda Dockerfile veya `requirements.txt` ile:
-```
-imagehash>=4.3.1
-```
+**Arka plan:** Aşama B Turn 3'te Colab session reset `imagehash`'i silmiş, `data/dedup/` collection ERROR vermişti. Tek seferlik `pip install imagehash` yerine dependency declaration kalıcı çözüm.
 
-**Bağımlılık:** §13.1, §13.3 öncesi.
+**Vast.ai:** `pip install -e ".[pretrain]"` aynı şekilde çalışır; ayrı `requirements.txt` gerekmez.
 
 ### 13.6 §11.7 v1 references preserved (akademik kayıt)
 
@@ -1103,9 +1097,11 @@ v8'den korunur: Roboflow Pothole 1125 + Yol 3 smoke reference numbers (§11.7'de
 
 **Aksiyon:** Sadece dokümante etme, §11.7 silinmez.
 
-### 13.7 `eval/run_matrix.py::_run_detection` STUB implement (yeni — Faz 5 öncesi kritik)
+### 13.7 `eval/run_matrix.py::_run_detection` STUB implement ✅ TAMAMLANDI (commit `87d3e9d`)
 
-**Status:** `eval/run_matrix.py` Faz 4.6'da yazıldı (26 test linear_probe için). Detection runner **stub**:
+**Status:** ✅ TAMAMLANDI (Adım 2, commit `87d3e9d`). `_run_detection` Ultralytics YOLO + `FinetuneDetectionTrainer` ile implemente edildi; 15 yeni test (`tests/test_run_matrix_detection.py`). Env var lifecycle (set→run→restore), Risk 16 v2 fix-safe. Aşağıdaki orijinal plan akademik kayıt için korunur.
+
+**Status (orijinal):** `eval/run_matrix.py` Faz 4.6'da yazıldı (26 test linear_probe için). Detection runner **stub**:
 
 ```python
 def _run_detection(cell, hp):
@@ -1187,9 +1183,11 @@ Plan v8 §4 ve v9 §4'te eval/run_matrix.py "✅ tamamlandı" olarak işaretlenm
 
 **Akademik gerekçe:** Reviewer "ablation grid kaç runda toplandı?" sorusuna "PretrainMatrix orchestrator otomatik resume ile tek komutla 27 cell" cevabı — sadece detection runner kurulduğunda mümkün.
 
-### 13.8 `pipeline.py::run_ssl` modern hatla rewire (yeni — UX iyileştirme)
+### 13.8 `pipeline.py::run_ssl` modern hatla rewire ✅ TAMAMLANDI (commit `db6faf4`)
 
-**Status:** `pipeline.py` v0.2.0'da yazıldı (legacy hat). `auto_train()` ve `SSLFinetunePipeline.run_ssl()` `SSLPretrainer` (legacy) kullanıyor. Modern `DenseSSLPretrainer` paket içinde mevcut ama UX'e bağlı değil.
+**Status:** ✅ TAMAMLANDI (Adım 3, commit `db6faf4`). `PipelineConfig.ssl_method` seçici eklendi (default `"dense"`); `run_ssl` dense/legacy dispatch + bilinmeyen değer→`ConfigError`. Production-validated 10 SAPS/dense alanı `PipelineConfig`'e eklendi. 11 yeni test (`tests/test_pipeline_ssl_method.py`, 2 slow). Cerrahi değişiklik — `run_finetune/run_detection/run/summary/auto_train` dokunulmadı. Tam suite 849 passed; Hat C C11/C13 dense default ile yeşil (regresyon yok). Aşağıdaki orijinal plan akademik kayıt için korunur.
+
+**Status (orijinal):** `pipeline.py` v0.2.0'da yazıldı (legacy hat). `auto_train()` ve `SSLFinetunePipeline.run_ssl()` `SSLPretrainer` (legacy) kullanıyor. Modern `DenseSSLPretrainer` paket içinde mevcut ama UX'e bağlı değil.
 
 **Karar (kullanıcı): Seçenek Y — geriye uyumlu rewire**
 
@@ -1271,6 +1269,39 @@ auto_train(data="data.yaml", unlabeled="/path/to/pool", epochs=100)
 # → otomatik SSL pretrain (modern dense SAPS) + finetune
 ```
 Bu Ultralytics-seviyesinde kolaylık — paper'ın "real-time deployment" + "easy to adopt" konumlanmasını destekler.
+
+---
+
+### 13.9 Aşama B — Integration Smoke Suite ✅ TAMAMLANDI (commit `206f3b8`..`151aca7`)
+
+**Status:** ✅ TAMAMLANDI. INVENTORY §8 "UX coverage gap" kapatıldı — kütüphanenin 4 paralel API hattı uçtan uca smoke kapsamına alındı.
+
+**Kapsam:** 64 senaryo / 112 test, `tests/integration/` altında 4 dosya + paylaşılan `conftest.py`:
+
+| Hat | Modül grubu | Senaryo | Test | Commit |
+|---|---|---|---|---|
+| D — Data Infra | `data/` (label_fraction, unified_loader, ssl_pool, dedup) | 15 | 15 | `206f3b8` |
+| A — Modern Dense | `dense/`, `pretrain/dense_trainer`, `eval/` | 17 | 33 | `b862a84` |
+| B — Legacy Pretext | `pretext/`, `adapters/`, `pretrain/trainer` | 15 | 43 | `b4100db` |
+| C — UX Façade | `pipeline.py`, `discovery.py`, top-level `__init__` | 17 | 21 | `151aca7` |
+
+**Sonuç:** Tam suite 726→838 passed (+112). Sandbox API kalibrasyonu (project_knowledge_search) her turn öncesi yapıldı — yanlış varsayımlar (MANIFEST 10-sütun schema, pretext 6 task vs plandaki 9) teslim öncesi yakalandı.
+
+**Akademik gerekçe:** Reviewer "kütüphane test edildi mi" sorusuna birim testlerin ötesinde 4-hat whole-path integration ağı gösterilebilir. C16 §11.11 sentinel testi modern hat top-level export gap'ini kasıtlı pinler.
+
+### 13.10 Integration Smoke API Bulguları (akademik kayıt — paper supplementary §A)
+
+Aşama B + Adım 3 sırasında keşfedilen, plana yazılmamış kütüphane davranışları. Paper supplementary §A "honest research process" damgasına katkı + kütüphane bakım kaydı:
+
+1. **`print_every >= 1` zımni constraint.** `DenseSSLPretrainer.train()` ve `SSLPretrainer.train()` `print_every=0` verilince `dense_trainer.py:603` `epoch % print_every` → `ZeroDivisionError`. Docstring'de belirtilmemiş. Test ve kullanım kodu `print_every >= 1` vermeli. (Aşama B Turn 2'de yakalandı.)
+
+2. **`MultiScaleProjectionHead` "caller normalizes" sözleşmesi.** Head L2-normalize ETMEZ — ham embedding döndürür. `dense/projection.py` docstring + `test_projection.py::test_output_not_normalized` ile doğrulanmış. Tüketen kod `F.normalize` uygular. (İlk test taslağı yanlış varsaymıştı; düzeltildi.)
+
+3. **`_run_detection` device kaynağı.** Device `hp.get("device")` ile okunur — `cell`'den DEĞİL. Default `0` (CUDA); CPU runtime'da `ValueError`. Testler runtime-bağımsız olmak için `hp["device"]="cpu"` vermeli. (A15 dersi: GPU runtime default `0`'ı maskelemişti, CPU runtime bug'ı ortaya çıkardı.)
+
+4. **Dense vs legacy checkpoint schema farkı.** `DenseSSLPretrainer` checkpoint: `model_state_dict` anahtarı + `extra.type="dense_ssl"`, top-level `type="ssl_pretrained"`. Legacy `SSLPretrainer` farklı schema. Checkpoint tüketen kod hat-spesifik olmalı.
+
+5. **chore — `pytest.mark.slow` registration + dependency pin (commit `d3910a7`).** `[tool.pytest.ini_options] markers` ile `slow` marker kaydedildi (önceden `PytestUnknownMarkWarning`). `imagehash`/`pandas`/`pyarrow` `pretrain` extras'a pinlendi (§13.5).
 
 ---
 
