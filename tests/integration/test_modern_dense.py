@@ -749,11 +749,11 @@ class TestA15_RunMatrixDetection:
             "dataset": {"name": "smoke_ds", "data_yaml": ds["data_yaml"], "num_classes": 2},
             "seed": 42,
             "fraction": 1.0,
-            "device": "cpu",
         }
         hp = {
             "epochs": 1, "imgsz": 160, "batch": 2,
             "freeze": 10, "unfreeze_epoch": 0, "backbone_lr_scale": 0.5,
+            "device": "cpu",
             "project": str(tmp_workspace / "det_runs"),
         }
 
