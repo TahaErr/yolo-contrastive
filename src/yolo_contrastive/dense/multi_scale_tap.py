@@ -12,8 +12,10 @@ YOLOv8 architecture reference (yolov8.yaml head section):
     Layer 21: C2f → P5/32 output
     Layer 22: Detect head [[15, 18, 21]]
 
-Indices are identical for n/s/m/l/x — only channel widths differ.
-v9/v10/v11 support is deferred to Faz 1.6 (probe-based detection).
+Layer indices are auto-detected from the model's Detect head (.f
+attribute) via detect_fpn_layers(), so v8/v9/v10/v11/v12/v26 and
+future versions all work. YOLOV8_FPN_LAYERS remains as a fallback
+for bare nn.Sequential inputs that have no Detect head.
 """
 
 from __future__ import annotations
@@ -67,6 +69,47 @@ def _get_layer_sequence(model: nn.Module) -> nn.Sequential:
     )
 
 
+def detect_fpn_layers(
+    model: nn.Module, levels: Tuple[str, ...]
+) -> Optional[Dict[str, int]]:
+    """Read P3/P4/P5 layer indices from the model's Detect head.
+
+    Every Ultralytics detection model ends in a Detect-family head whose
+    ``.f`` attribute lists the layer indices feeding it -- the P3/P4/P5
+    FPN outputs in ascending stride order. This is the architecture's own
+    ground truth and works across YOLOv8/9/10/11/12/26 and future
+    versions, unlike the hardcoded YOLOV8_FPN_LAYERS table (correct only
+    for v8/v9 -- v10/v11/v12/v26 use different indices).
+
+    Returns ``{level: index}`` for the requested levels, or ``None`` if
+    no Detect head with a usable ``.f`` is found (e.g. a bare
+    nn.Sequential) -- the caller then falls back to the static v8 table.
+    """
+    try:
+        seq = _get_layer_sequence(model)
+    except FeatureTapError:
+        return None
+    if len(seq) == 0:
+        return None
+
+    head = seq[-1]
+    if type(head).__name__ not in (
+        "Detect", "v10Detect", "Segment", "Pose", "OBB"
+    ):
+        return None
+
+    f = getattr(head, "f", None)
+    if not isinstance(f, (list, tuple)):
+        return None
+    idxs = [i for i in f if isinstance(i, int) and i >= 0]
+    if len(idxs) < len(levels):
+        return None
+
+    # ascending stride order -> P3, P4, P5; last len(levels) entries
+    idxs = sorted(idxs)[-len(levels):]
+    return {lv: idxs[i] for i, lv in enumerate(levels)}
+
+
 class MultiScaleFeatureTap:
     """Extracts feature maps from multiple FPN layers via forward hooks.
 
@@ -93,11 +136,19 @@ class MultiScaleFeatureTap:
         self.levels: Tuple[str, ...] = tuple(levels)
 
         if layer_indices is not None:
+            # explicit override -- caller knows best
             self.layer_indices = dict(layer_indices)
         else:
-            self.layer_indices = {
-                k: YOLOV8_FPN_LAYERS[k] for k in self.levels if k in YOLOV8_FPN_LAYERS
-            }
+            # architecture-agnostic: read P3/P4/P5 from the Detect head.
+            detected = detect_fpn_layers(model, self.levels)
+            if detected is not None:
+                self.layer_indices = detected
+            else:
+                # fallback: bare nn.Sequential / no Detect head -> v8 table
+                self.layer_indices = {
+                    k: YOLOV8_FPN_LAYERS[k]
+                    for k in self.levels if k in YOLOV8_FPN_LAYERS
+                }
 
         for level in self.levels:
             if level not in self.layer_indices:

@@ -4,6 +4,7 @@ from .multi_scale_tap import (
     MultiScaleFeatureTap,
     YOLOV8_FPN_LAYERS,
     YOLOV8_FPN_STRIDES,
+    detect_fpn_layers,
 )
 from .queue import FeatureQueue, combine_queues
 from .momentum_encoder import MomentumEncoder
@@ -15,6 +16,7 @@ from .saps import saps_within_loss, saps_cross_loss
 
 __all__ = [
     "MultiScaleFeatureTap",
+    "detect_fpn_layers",
     "YOLOV8_FPN_LAYERS",
     "YOLOV8_FPN_STRIDES",
     "FeatureQueue",

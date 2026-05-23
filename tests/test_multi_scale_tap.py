@@ -302,3 +302,70 @@ class TestRealYOLOv8:
                 f"{level}: expected stride {expected_stride}, got {actual_stride} "
                 f"(shape={tuple(t.shape)})"
             )
+
+
+# ── architecture-agnostic Detect.f layer detection (v9 — smoke bug fix) ──
+
+
+class TestDetectFpnLayers:
+    """detect_fpn_layers reads P3/P4/P5 indices from the Detect head, so the
+    tap works across YOLOv8/9/10/11/12/26 — not just the hardcoded v8 table.
+
+    These tests need ultralytics + real weights; skipped if unavailable.
+    """
+
+    # Detect.f indices verified against real models (Faz 5.2 smoke).
+    EXPECTED = {
+        "yolov8n.pt": [15, 18, 21],
+        "yolov9t.pt": [15, 18, 21],
+        "yolov10n.pt": [16, 19, 22],
+        "yolo11n.pt": [16, 19, 22],
+        "yolo12n.pt": [14, 17, 20],
+        "yolo26n.pt": [16, 19, 22],
+    }
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("model_name,expected", list(EXPECTED.items()))
+    def test_detect_fpn_layers_matches_architecture(self, model_name, expected):
+        ultralytics = pytest.importorskip("ultralytics")
+        from yolo_contrastive.dense import detect_fpn_layers
+
+        model = ultralytics.YOLO(model_name).model
+        idx = detect_fpn_layers(model, ("P3", "P4", "P5"))
+        assert idx is not None, f"{model_name}: Detect head not found"
+        assert [idx["P3"], idx["P4"], idx["P5"]] == expected
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("model_name", list(EXPECTED.keys()))
+    def test_tap_extracts_correct_strides(self, model_name):
+        """Tapped P3/P4/P5 are 4D feature maps at stride 8/16/32 — not the
+        Detect head output (the v12 failure mode from Faz 5.2 smoke)."""
+        ultralytics = pytest.importorskip("ultralytics")
+        model = ultralytics.YOLO(model_name).model.eval()
+
+        tap = MultiScaleFeatureTap(model)  # layer_indices=None -> auto-detect
+        tap.setup()
+        with torch.no_grad():
+            model(torch.rand(2, 3, 320, 320))
+        feats = tap.get_features()
+        tap.close()
+
+        for level, stride in [("P3", 8), ("P4", 16), ("P5", 32)]:
+            t = feats[level]
+            assert torch.is_tensor(t) and t.dim() == 4, (
+                f"{model_name} {level}: not a 4D feature map "
+                f"(got {type(t).__name__}) — tap hit the wrong layer"
+            )
+            assert 320 // t.shape[2] == stride, (
+                f"{model_name} {level}: stride {320 // t.shape[2]} != {stride}"
+            )
+
+    def test_falls_back_to_v8_table_for_bare_sequential(self):
+        """A bare nn.Sequential has no Detect head — detect_fpn_layers
+        returns None and the tap falls back to YOLOV8_FPN_LAYERS."""
+        from yolo_contrastive.dense import detect_fpn_layers
+
+        seq = _dummy_seq()
+        assert detect_fpn_layers(seq, ("P3", "P4", "P5")) is None
+        tap = MultiScaleFeatureTap(seq)
+        assert tap.layer_indices == YOLOV8_FPN_LAYERS
