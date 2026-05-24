@@ -520,6 +520,10 @@ class DenseSSLPretrainer:
         # ── loop ────────────────────────────────────────────────────────
         global_step = 0
         best_loss = float("inf")
+        # Per-epoch metric history — persisted into the final checkpoint's
+        # `extra` so loss curves survive the run (paper Figure 2, plan §5.1).
+        # The console print is gated by print_every; this list is not.
+        loss_history: list = []
         t0_total = time.time()
 
         try:
@@ -600,6 +604,15 @@ class DenseSSLPretrainer:
                 avg_neg = ep_neg / max(1, n_batches)
                 ep_time = time.time() - t0
 
+                loss_history.append({
+                    "epoch": epoch,
+                    "loss": avg_loss,
+                    "acc_top1": avg_acc,
+                    "pos_sim": avg_pos,
+                    "neg_sim": avg_neg,
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                })
+
                 if epoch % print_every == 0 or epoch == 1 or epoch == epochs:
                     self._print(
                         f"[ycl-dense] epoch {epoch:3d}/{epochs} | "
@@ -620,7 +633,8 @@ class DenseSSLPretrainer:
 
             # Final save
             save_backbone(self.model, output, epoch=epochs,
-                          extra={"loss": best_loss, "type": "dense_ssl"})
+                          extra={"loss": best_loss, "type": "dense_ssl",
+                                 "loss_history": loss_history})
             total_time = time.time() - t0_total
             self._print(
                 f"[ycl-dense] === Done in {total_time:.1f}s | "

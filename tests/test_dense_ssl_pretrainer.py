@@ -387,6 +387,57 @@ class TestFullTrainSmoke:
             shutil.rmtree(tmp_imgs, ignore_errors=True)
             shutil.rmtree(tmp_out_dir, ignore_errors=True)
 
+    def test_loss_history_persisted(self):
+        """train() records per-epoch metrics into extra['loss_history'] —
+        loss curves survive the run for paper Figure 2 (plan §5.1).
+        Backward-compat: the pre-existing extra keys must stay intact."""
+        tmp_imgs = _dummy_images_dir(n=8, size=64)
+        tmp_out_dir = tempfile.mkdtemp(prefix="ycl_dense_hist_")
+        try:
+            output_path = os.path.join(tmp_out_dir, "backbone.pt")
+            tr = _make_trainer()
+            try:
+                tr.train(
+                    images_dir=tmp_imgs,
+                    epochs=3,
+                    batch_size=2,
+                    lr=1e-3,
+                    warmup_epochs=0,
+                    num_workers=0,
+                    output=output_path,
+                    save_every=0,
+                    print_every=1,
+                )
+            finally:
+                tr.cleanup()
+
+            ckpt = torch.load(output_path, map_location="cpu",
+                              weights_only=False)
+            extra = ckpt.get("extra", {})
+
+            # backward-compat — old keys still present
+            assert extra.get("type") == "dense_ssl"
+            assert "loss" in extra
+
+            # loss_history — one record per epoch
+            hist = extra.get("loss_history")
+            assert hist is not None, "extra['loss_history'] missing"
+            assert len(hist) == 3, f"expected 3 epoch records, got {len(hist)}"
+
+            # each record carries the expected metric keys
+            expected_keys = {"epoch", "loss", "acc_top1",
+                             "pos_sim", "neg_sim", "lr"}
+            for rec in hist:
+                assert expected_keys <= set(rec.keys()), (
+                    f"record missing keys: {expected_keys - set(rec.keys())}"
+                )
+
+            # epoch field is ordered 1..N
+            assert [r["epoch"] for r in hist] == [1, 2, 3]
+        finally:
+            shutil.rmtree(tmp_imgs, ignore_errors=True)
+            shutil.rmtree(tmp_out_dir, ignore_errors=True)
+
 
 # ── checkpoint roundtrip ────────────────────────────────────────────────
 
