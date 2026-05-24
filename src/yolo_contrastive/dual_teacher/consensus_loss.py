@@ -44,16 +44,22 @@ def _cwd_kl(student: torch.Tensor, teacher: torch.Tensor, T: float) -> torch.Ten
     """Channel-wise KL divergence, per-position contribution.
 
     Each channel's HxW map is softmax-normalized (CWD, Shu et al. 2021).
-    KL(teacher || student) is computed per channel; the per-position
-    contribution is returned (channel-averaged) so a spatial weight map can
-    modulate it.
+    KL(teacher || student) is computed per channel by summing over the
+    spatial axis, yielding one non-negative scalar per channel.
 
     Args:
         student, teacher: ``[B, C, H, W]`` feature maps (same shape).
         T: softmax temperature.
 
+    Per CWD (Shu et al. 2021) the softmax is taken over the H*W spatial axis
+    and the KL divergence is *summed over that same axis* — KL is only
+    guaranteed non-negative (Gibbs) when summed over the full distribution.
+    Summing yields one scalar per channel; the channel mean is then the
+    per-image Form-C contribution.
+
     Returns:
-        ``[B, H, W]`` per-position KL contribution, T^2-scaled (Hinton/CWD).
+        ``[B, C]`` per-channel KL divergence, T^2-scaled (Hinton/CWD).
+        Each entry is >= 0 by Gibbs' inequality.
     """
     B, C, H, W = student.shape
     s = (student.float() / T).reshape(B, C, H * W)
@@ -61,8 +67,10 @@ def _cwd_kl(student: torch.Tensor, teacher: torch.Tensor, T: float) -> torch.Ten
     s_logp = F.log_softmax(s, dim=2)        # spatial softmax per channel
     t_logp = F.log_softmax(t, dim=2)
     t_p = t_logp.exp()
-    kl = t_p * (t_logp - s_logp)            # [B, C, HW] per-position KL term
-    kl = kl.reshape(B, C, H, W).mean(dim=1)  # channel-average → [B, H, W]
+    kl_terms = t_p * (t_logp - s_logp)      # [B, C, HW] per-position terms
+    # KL = sum over the distribution axis (HW). Only the *sum* is the KL
+    # divergence and is >= 0; individual positions may be negative.
+    kl = kl_terms.sum(dim=2)                # [B, C] per-channel KL, >= 0
     return kl * (T * T)
 
 
@@ -169,13 +177,17 @@ class ConsensusLoss(nn.Module):
                     lv_info["form_B"] = float(lb.detach())
 
                 if use_c:
-                    lc_map = (
+                    # CWD dual KL — [B, C] per-channel, >= 0 (Gibbs).
+                    lc_bc = (
                         _cwd_kl(s, c, self.kl_temperature)
                         + _cwd_kl(s, sl, self.kl_temperature)
-                    )  # [B, H, W]
+                    )  # [B, C]
                     if dw is not None:
-                        lc_map = lc_map * dw
-                    lc = lc_map.mean()
+                        # disagreement is a spatial [B, H, W] map; Form C's KL
+                        # lives in channel space, so modulate by the per-image
+                        # spatial mean of the weight (keeps KL >= 0).
+                        lc_bc = lc_bc * dw.mean(dim=(1, 2), keepdim=True)
+                    lc = lc_bc.mean()
                     lc_terms.append(lc)
                     lv_info["form_C"] = float(lc.detach())
 

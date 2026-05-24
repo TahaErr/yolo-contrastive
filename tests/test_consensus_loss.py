@@ -119,8 +119,40 @@ class TestFormC:
 
         feat = torch.randn(2, 8, 4, 4)
         kl = _cwd_kl(feat, feat, T=4.0)
-        assert kl.shape == (2, 4, 4)
+        # CWD: KL is summed over the spatial axis -> one scalar per channel.
+        assert kl.shape == (2, 8)
         assert torch.allclose(kl, torch.zeros_like(kl), atol=1e-5)
+
+    def test_cwd_kl_non_negative_invariant(self):
+        """KL divergence is >= 0 (Gibbs). _cwd_kl sums over the spatial axis,
+        so every per-channel entry must be non-negative for ANY input — the
+        regression guard for the Faz 5.3 negative-distill bug."""
+        from yolo_contrastive.dual_teacher.consensus_loss import _cwd_kl
+
+        for seed in range(30):
+            torch.manual_seed(seed)
+            student = torch.randn(2, 8, 4, 4)
+            teacher = torch.randn(2, 8, 4, 4)
+            kl = _cwd_kl(student, teacher, T=4.0)
+            assert (kl >= -1e-6).all(), (
+                f"seed {seed}: _cwd_kl produced a negative value "
+                f"{kl.min().item()} — KL must be >= 0"
+            )
+
+    def test_form_c_non_negative_across_temperatures(self):
+        """Form C loss stays >= 0 regardless of input or kl_temperature —
+        guards the dual-KL aggregation in forward()."""
+        from yolo_contrastive.dual_teacher.consensus_loss import ConsensusLoss
+
+        for T in (1.0, 2.0, 4.0, 8.0):
+            for seed in range(8):
+                torch.manual_seed(seed)
+                loss_fn = ConsensusLoss(distill_form="C", kl_temperature=T)
+                loss, info = loss_fn(_feats(), _feats(), _feats())
+                assert loss.item() >= -1e-6, (
+                    f"T={T} seed={seed}: Form C loss negative {loss.item()}"
+                )
+                assert info["form_C"] >= -1e-6
 
 
 # ═════════════════════════════════════════════════════════════════════════
