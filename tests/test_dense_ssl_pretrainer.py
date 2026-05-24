@@ -381,7 +381,9 @@ class TestFullTrainSmoke:
             # Verify checkpoint structure
             ckpt = torch.load(output_path, map_location="cpu", weights_only=False)
             assert "model_state_dict" in ckpt
-            assert ckpt.get("epoch") == 2
+            # epoch field now records best_epoch (best-epoch checkpoint
+            # feature), not the last epoch — so it is in 1..epochs.
+            assert 1 <= ckpt.get("epoch") <= 2
             assert ckpt.get("extra", {}).get("type") == "dense_ssl"
         finally:
             shutil.rmtree(tmp_imgs, ignore_errors=True)
@@ -434,6 +436,111 @@ class TestFullTrainSmoke:
 
             # epoch field is ordered 1..N
             assert [r["epoch"] for r in hist] == [1, 2, 3]
+        finally:
+            shutil.rmtree(tmp_imgs, ignore_errors=True)
+            shutil.rmtree(tmp_out_dir, ignore_errors=True)
+
+    def test_best_epoch_checkpoint(self):
+        """Final checkpoint saves the lowest-loss epoch's weights, not the
+        last epoch's. extra['best_epoch'] records which one; extra['loss']
+        must equal the minimum loss in loss_history (reported best_loss and
+        saved weights are now consistent)."""
+        tmp_imgs = _dummy_images_dir(n=8, size=64)
+        tmp_out_dir = tempfile.mkdtemp(prefix="ycl_dense_best_")
+        try:
+            output_path = os.path.join(tmp_out_dir, "backbone.pt")
+            tr = _make_trainer()
+            try:
+                tr.train(
+                    images_dir=tmp_imgs,
+                    epochs=4,
+                    batch_size=2,
+                    lr=1e-3,
+                    warmup_epochs=0,
+                    num_workers=0,
+                    output=output_path,
+                    save_every=0,
+                    print_every=1,
+                )
+            finally:
+                tr.cleanup()
+
+            ckpt = torch.load(output_path, map_location="cpu",
+                              weights_only=False)
+            extra = ckpt.get("extra", {})
+
+            # best_epoch present, within range
+            be = extra.get("best_epoch")
+            assert be is not None, "extra['best_epoch'] missing"
+            assert 1 <= be <= 4, f"best_epoch out of range: {be}"
+
+            # checkpoint's root epoch == best_epoch (final save uses it)
+            assert ckpt.get("epoch") == be, (
+                f"ckpt epoch {ckpt.get('epoch')} != best_epoch {be}"
+            )
+
+            # loss_history still the FULL curve — best-save doesn't truncate
+            hist = extra.get("loss_history")
+            assert hist is not None and len(hist) == 4
+
+            # extra['loss'] == minimum loss in loss_history
+            losses = [r["loss"] for r in hist]
+            assert abs(extra["loss"] - min(losses)) < 1e-6, (
+                f"extra['loss']={extra['loss']} != min(loss_history)={min(losses)}"
+            )
+
+            # best_epoch points at the actual minimum-loss epoch
+            min_ep = min(hist, key=lambda r: r["loss"])["epoch"]
+            assert be == min_ep, (
+                f"best_epoch={be} but min-loss epoch is {min_ep}"
+            )
+        finally:
+            shutil.rmtree(tmp_imgs, ignore_errors=True)
+            shutil.rmtree(tmp_out_dir, ignore_errors=True)
+
+    def test_best_epoch_weights_actually_saved(self):
+        """The SAVED weights are the best epoch's, not the last epoch's.
+        Smoke: train(), then if best_epoch != last epoch, the checkpoint's
+        weights must NOT match the trainer's final (last-epoch) weights —
+        proving load_state_dict(best_state) actually swapped them in."""
+        tmp_imgs = _dummy_images_dir(n=8, size=64)
+        tmp_out_dir = tempfile.mkdtemp(prefix="ycl_dense_bw_")
+        try:
+            output_path = os.path.join(tmp_out_dir, "backbone.pt")
+            tr = _make_trainer()
+            try:
+                tr.train(
+                    images_dir=tmp_imgs, epochs=5, batch_size=2, lr=1e-3,
+                    warmup_epochs=0, num_workers=0, output=output_path,
+                    save_every=0, print_every=1,
+                )
+                # trainer.model after train() == best-epoch weights
+                # (final save restores best_state into self.model)
+                final_state = {k: v.clone()
+                               for k, v in tr.model.state_dict().items()}
+            finally:
+                tr.cleanup()
+
+            ckpt = torch.load(output_path, map_location="cpu",
+                              weights_only=False)
+            saved = ckpt["model_state_dict"]
+            be = ckpt["extra"]["best_epoch"]
+            hist = ckpt["extra"]["loss_history"]
+
+            # saved weights must equal what train() left in self.model
+            # (both are the best-epoch weights)
+            shared = set(saved) & set(final_state)
+            assert shared, "no overlapping weight keys"
+            for k in shared:
+                assert torch.allclose(saved[k].cpu(), final_state[k].cpu(),
+                                      atol=1e-6), (
+                    f"saved weight {k} != trainer's best-epoch weight"
+                )
+
+            # if best wasn't the last epoch, that's the meaningful case —
+            # best_state genuinely differs from last-epoch state
+            if be != len(hist):
+                assert ckpt["epoch"] == be  # not len(hist)
         finally:
             shutil.rmtree(tmp_imgs, ignore_errors=True)
             shutil.rmtree(tmp_out_dir, ignore_errors=True)

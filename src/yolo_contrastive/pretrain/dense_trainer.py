@@ -520,6 +520,13 @@ class DenseSSLPretrainer:
         # ── loop ────────────────────────────────────────────────────────
         global_step = 0
         best_loss = float("inf")
+        # Track the weights of the lowest-loss epoch, not just the last.
+        # train() runs a cosine LR to ~0; with some queue strategies the last
+        # few epochs drift up in loss (Stage 1: pooled tail-rise). Saving the
+        # best-epoch weights makes the checkpoint match the reported best_loss.
+        import copy as _copy
+        best_state = None
+        best_epoch = 0
         # Per-epoch metric history — persisted into the final checkpoint's
         # `extra` so loss curves survive the run (paper Figure 2, plan §5.1).
         # The console print is gated by print_every; this list is not.
@@ -630,15 +637,23 @@ class DenseSSLPretrainer:
 
                 if avg_loss < best_loss:
                     best_loss = avg_loss
+                    best_epoch = epoch
+                    best_state = _copy.deepcopy(self.model.state_dict())
 
-            # Final save
-            save_backbone(self.model, output, epoch=epochs,
+            # Final save — restore the best-epoch weights, then save.
+            # loss_history stays the full curve (paper Figure 2); only the
+            # *weights* are the best epoch's. best_epoch records which one.
+            if best_state is not None:
+                self.model.load_state_dict(best_state)
+            save_backbone(self.model, output, epoch=best_epoch or epochs,
                           extra={"loss": best_loss, "type": "dense_ssl",
-                                 "loss_history": loss_history})
+                                 "loss_history": loss_history,
+                                 "best_epoch": best_epoch or epochs})
             total_time = time.time() - t0_total
             self._print(
                 f"[ycl-dense] === Done in {total_time:.1f}s | "
-                f"best_loss={best_loss:.4f} → {output} ==="
+                f"best_loss={best_loss:.4f} @ epoch {best_epoch or epochs} "
+                f"→ {output} ==="
             )
 
         finally:
