@@ -2,6 +2,7 @@
 # Stage 1 — Smoke ablation (pipeline + mode×queue minimal interaction)
 # =============================================================================
 # Purpose:
+#   4-dataset balanced 5K subset (BDD/Cityscapes/Mapillary/A2D2).
 #   Validate end-to-end pretrain pipeline on the SAPS-mode × queue-strategy
 #   axes that constitute the paper's main hypothesis. Smoke-grade pool & epoch
 #   count — results here are NOT paper data, they signal "code works + the
@@ -32,7 +33,7 @@ output_csv: /content/runs/ablation_stage1/results.csv
 
 base:
   # ── Data ──────────────────────────────────────────────────────────────
-  images_dir: /content/datasets/bdd100k_ssl_5k
+  images_dir: /content/ssl_pool_5k
 
   # ── Model (DenseSSLPretrainer constructor kwargs) ─────────────────────
   model: yolov8n.pt

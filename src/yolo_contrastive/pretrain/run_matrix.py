@@ -110,15 +110,41 @@ def _run_pretrain(cell: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
     """
     from .dense_trainer import DenseSSLPretrainer  # local import — see docstring
 
+    import inspect
+
     merged = {**base, **cell["axes"]}
     # train()-time kwargs vs. constructor-time kwargs are split here so the
-    # caller doesn't need to remember which is which.
+    # caller doesn't need to remember which is which. A third class —
+    # orchestrator *meta* keys (e.g. output_dir) — belongs to neither: they
+    # configure run_matrix itself, not the trainer. The split is therefore
+    # signature-driven: init_kwargs is filtered to what __init__ actually
+    # accepts, so any meta/unknown key is dropped instead of crashing the
+    # constructor. (Pre-fix: a bare "not in train_keys" rule routed
+    # output_dir into init_kwargs → TypeError. Mock-runner unit tests never
+    # exercised this real split — see plan §10.33.)
     train_keys = {
         "images_dir", "epochs", "batch_size", "lr", "warmup_epochs",
         "weight_decay", "num_workers", "output", "save_every", "print_every",
     }
     train_kwargs = {k: merged[k] for k in train_keys if k in merged}
-    init_kwargs = {k: v for k, v in merged.items() if k not in train_keys}
+
+    init_accepted = set(
+        inspect.signature(DenseSSLPretrainer.__init__).parameters
+    ) - {"self"}
+    init_kwargs = {
+        k: v for k, v in merged.items()
+        if k not in train_keys and k in init_accepted
+    }
+    # Keys that are neither a train kwarg, an __init__ param, nor a known
+    # meta key — surface them so a YAML typo isn't silently swallowed.
+    meta_keys = {"output_dir", "output_csv", "task"}
+    unknown = set(merged) - train_keys - init_accepted - meta_keys
+    if unknown:
+        DEFAULT_LOGGER_PRINT = print
+        DEFAULT_LOGGER_PRINT(
+            f"[run_matrix] WARN: YAML key(s) {sorted(unknown)} match no "
+            f"trainer arg or known meta key — ignored. Check for typos."
+        )
 
     backbone_path = train_kwargs.get("output") or os.path.join(
         merged.get("output_dir", "."), f"{cell['cell_id']}.pt"

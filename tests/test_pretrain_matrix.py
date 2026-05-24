@@ -461,3 +461,119 @@ class TestYamlRoundtrip:
     def test_constructor_requires_config(self):
         with pytest.raises(ValueError, match="config_path or config"):
             PretrainMatrix(output_csv="/tmp/x.csv")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# _run_pretrain interface — the REAL runner's kwarg routing.
+#
+# Every other test here uses a mock runner; the orchestration logic is
+# covered, but the real _run_pretrain ↔ DenseSSLPretrainer interface —
+# how merged YAML keys split into __init__ vs train() vs meta — was never
+# exercised. That gap let the output_dir bug ship (plan §10.33): a base
+# key that is neither a train kwarg nor an __init__ param was routed into
+# init_kwargs, crashing the constructor. These tests stub DenseSSLPretrainer
+# so the split is verified without running a real trainer.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestRunPretrainInterface:
+    @staticmethod
+    def _stub_trainer_module(monkeypatch):
+        """Replace DenseSSLPretrainer with a stub that records the kwargs it
+        was constructed / trained with. Returns the record dict."""
+        rec = {"init_kwargs": None, "train_kwargs": None}
+
+        class _StubPretrainer:
+            # __init__ signature MUST mirror the real DenseSSLPretrainer so
+            # _run_pretrain's signature-based filtering sees the same params.
+            def __init__(self, model=None, weights=None, saps_mode="none",
+                         out_dim=128, queue_size=4096, queue_update_strategy="pooled",
+                         queue_subsample_n=16, saps_both_lambda=1.0,
+                         saps_t_scale=1.0, saps_strict_negatives=False,
+                         n_query=128, pos_radius=0.07, match_mode="threshold",
+                         momentum=0.99, temperature=0.2, imgsz=640,
+                         aug_kwargs=None, device=None, logger=None):
+                rec["init_kwargs"] = dict(
+                    model=model, saps_mode=saps_mode, out_dim=out_dim,
+                    queue_size=queue_size,
+                    queue_update_strategy=queue_update_strategy,
+                    imgsz=imgsz, device=device,
+                )
+
+            def train(self, images_dir=None, epochs=100, batch_size=32,
+                      lr=1e-3, warmup_epochs=5, weight_decay=0.0,
+                      num_workers=4, output="bb.pt", save_every=25,
+                      print_every=10):
+                rec["train_kwargs"] = dict(
+                    images_dir=images_dir, epochs=epochs,
+                    batch_size=batch_size, output=output,
+                )
+                return output
+
+            def cleanup(self):
+                pass
+
+        import yolo_contrastive.pretrain.dense_trainer as dt_mod
+        monkeypatch.setattr(dt_mod, "DenseSSLPretrainer", _StubPretrainer)
+        return rec
+
+    def test_output_dir_not_routed_to_init(self, monkeypatch):
+        """output_dir is an orchestrator meta key — it must NOT reach the
+        trainer constructor. This is the exact bug from the Faz 5.1 smoke."""
+        from yolo_contrastive.pretrain.run_matrix import _run_pretrain
+
+        rec = self._stub_trainer_module(monkeypatch)
+        cell = {
+            "cell_id": "abc123",
+            "axes": {"saps_mode": "both"},
+            "base": {},
+        }
+        base = {
+            "model": "yolov8n.pt", "imgsz": 320, "out_dim": 128,
+            "queue_size": 4096, "epochs": 30, "batch_size": 32,
+            "images_dir": "/data/pool",
+            "output_dir": "/runs/stage1",      # the meta key — must be dropped
+        }
+        # Pre-fix: this raised TypeError(unexpected kwarg 'output_dir').
+        out = _run_pretrain(cell, base)
+
+        assert "output_dir" not in rec["init_kwargs"]
+        assert out["backbone_path"] == "/runs/stage1/abc123.pt"
+
+    def test_init_vs_train_kwarg_split(self, monkeypatch):
+        """Constructor params land in __init__, train params land in train()."""
+        from yolo_contrastive.pretrain.run_matrix import _run_pretrain
+
+        rec = self._stub_trainer_module(monkeypatch)
+        cell = {"cell_id": "c1", "axes": {"saps_mode": "within"}, "base": {}}
+        base = {
+            "model": "yolov8n.pt", "imgsz": 320, "out_dim": 256,
+            "epochs": 30, "batch_size": 16, "images_dir": "/data/pool",
+        }
+        _run_pretrain(cell, base)
+
+        # __init__ side
+        assert rec["init_kwargs"]["saps_mode"] == "within"
+        assert rec["init_kwargs"]["out_dim"] == 256
+        assert rec["init_kwargs"]["imgsz"] == 320
+        # train() side
+        assert rec["train_kwargs"]["epochs"] == 30
+        assert rec["train_kwargs"]["batch_size"] == 16
+        assert rec["train_kwargs"]["images_dir"] == "/data/pool"
+
+    def test_axes_override_base(self, monkeypatch):
+        """cell['axes'] overrides a same-named base key in the merge."""
+        from yolo_contrastive.pretrain.run_matrix import _run_pretrain
+
+        rec = self._stub_trainer_module(monkeypatch)
+        cell = {"cell_id": "c2",
+                "axes": {"saps_mode": "both", "queue_update_strategy": "per_position"},
+                "base": {}}
+        base = {
+            "model": "yolov8n.pt", "saps_mode": "none",   # axes должен override
+            "queue_update_strategy": "pooled",
+            "epochs": 10, "images_dir": "/d",
+        }
+        _run_pretrain(cell, base)
+        assert rec["init_kwargs"]["saps_mode"] == "both"
+        assert rec["init_kwargs"]["queue_update_strategy"] == "per_position"
