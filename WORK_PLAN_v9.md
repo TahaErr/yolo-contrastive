@@ -436,6 +436,31 @@ Eksenler: `saps_mode` × `saps_both_lambda` × `queue_update_strategy` × `saps_
 - 5.1.2 → 5.1.3: Best (mode, queue) pair'i belirlenmiş, λ/t_scale Stage 3'te
 - 5.1.3 → 5.2: En iyi 27-cell winner config sabitlenmiş
 
+**Stage 5.1.1 sonucu (v9 — gerçek A100 koşusu, 6/6 cell crash-free, ~52 dk).**
+Geçiş kriteri sağlandı; ayrıca eksenler ölçülebilir bir ayrım üretti:
+
+| cell | acc@1 ep30 | loss min (ep) | kuyruk-tırmanış |
+|---|---|---|---|
+| none / per_position | 0.811 | 2.704 (ep28) | +0.3% |
+| within / per_position | 0.806 | 2.845 (ep29) | +0.2% |
+| both / per_position | 0.786 | 5.833 (ep28) | +0.1% |
+| none / pooled | 0.789 | 2.516 (ep25) | +11.9% |
+| within / pooled | 0.763 | 2.770 (ep26) | +5.8% |
+| both / pooled | 0.761 | 5.630 (ep25) | +6.4% |
+
+İki bulgu: (1) **`queue_update_strategy=per_position` net üstün** — üç `saps_mode`'da
+da daha yüksek acc@1. (2) **`pooled` kuyruk-tırmanışı** — `pooled` cell'lerin üçü de
+son ~5 epoch'ta loss tırmanıyor (cosine LR ~0'a inerken `neg` benzerliği pozitife
+kayıyor, temsil daralıyor); `per_position` stabil (~+0.2%). `saps_mode` ekseni
+smoke ölçeğinde (5K/30ep) acc@1'de ayırt edilemez — Stage 2'ye açık eksen taşınır.
+**Stage 2'ye sabitlenen:** `queue_update_strategy=per_position`. **Açık eksenler:**
+`saps_mode`, `saps_both_lambda`.
+
+Yan ürün — kod iyileştirmesi: `pooled` tırmanışı, `DenseSSLPretrainer`'ın final
+checkpoint'i "last epoch" kaydetmesinin zirve-gerisi ağırlık tutmasına yol açtığını
+gösterdi. Düzeltildi (`a87e40f`): checkpoint artık **best-epoch** ağırlıklarını
+kaydeder, `extra` per-epoch `loss_history` taşır (paper Figure 2 verisi).
+
 **Çıktı:** Paper Table 1: "Pure SAPS ablation results". Faz 5.1'in winner config'i Faz 5.2 ve Faz 5.3'ün **baseline argument'i** olur.
 
 #### Faz 5.2 — Multi-backbone validation (yeni — generalization claim)
