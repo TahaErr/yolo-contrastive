@@ -960,6 +960,37 @@ Tüm repo, gerçek YOLOv8n + gerçek dummy veri ile sistematik tarandı: DT-SAPS
 
 Her iki bug'ın kör noktası teste bağlandı: CocoTeacher'a `TestSSLCheckpointLoading` (gerçek SSL-checkpoint yükleme), `test_augmentations.py` parametrize 6 preset.
 
+**Devam — Faz 5 eğitim smoke kampanyası (v9 ek).** Yukarıdaki repo bug avından sonra, her eğitim fazı (Faz 0/5.1/5.2/5.3/5.4/5.5) tam eğitimden önce gerçek A100'de küçük-ölçek smoke olarak koşuldu. Amaç aynı: birim testlerin kaçırdığı mantık hatalarını gerçek-run'da yakalamak. Kampanya 2 kök bug daha çıkardı — toplam 4:
+
+| Bug | Modül | Faz | Commit | Kök sebep |
+|---|---|---|---|---|
+| CocoTeacher SSL checkpoint | dual_teacher | (audit) | `1a30142` | string weight `YOLO().model` ile yükleniyordu; SSL checkpoint `model` anahtarı taşımıyor |
+| Augmentation preset eksik | augmentations | (audit) | `9973baa` | plan §5.3'ün atıfta bulunduğu preset isimleri `presets.py`'de yoktu |
+| MultiScaleFeatureTap mimari-bağımlı | dense | 5.2 | `6b53873` | P3/P4/P5 hardcoded `{15,18,21}` v8 indeksleriyle bulunuyordu; v10/v11/v12/v26 farklı indeks kullanıyor — v12 gürültülü patladı, v10/v11/v26 SESSİZCE yanlış katmandan tap'lendi |
+| ConsensusLoss Form C negatif KL | dual_teacher | 5.3 | `76c989a` | `_cwd_kl` KL'yi H×W spatial ekseni üzerinden toplamıyordu; KL'nin ≥0 garantisi yalnızca dağıtım ekseni toplamı için geçerli — per-position bırakılınca negatife sapıyor, B+C içine sızıyordu |
+
+**İki sessiz bug — neden kritik.** MultiScaleFeatureTap ve ConsensusLoss Form C bug'larının ortak özelliği: **crash etmiyorlardı.** Faz 5.2 smoke'unda 6 mimariden 5'i "✓" verdi — ama gerçekte sadece 2'si (v8/v9) doğru katmandan tap'leniyordu; 3'ü sessizce yanlış feature üretiyordu. Faz 5.3'te `both/C` senaryosu "✓" verdi — ama distill loss 8 epoch boyunca negatife (`-0.0436`) sapıyordu. İkisi de "test geçti / smoke ✓" deyip geçilebilirdi. Yakalanmaları iki ayrı disipline bağlıydı: (a) smoke çıktısındaki sayısal sentinel'lere bakmak (param sayısı tutarlılığı, loss işareti), (b) şüpheli her sinyali varsayımla kapatmak yerine izole teşhisle kovalamak.
+
+**Metodolojik ders — warmup'sız kısa smoke loss eğrisini gizler.** Faz 5.1'de ilk smoke 2-epoch, warmup=0 idi; loss ARTIYOR göründü — alarm. 15-epoch warmup=3 diagnostik koşusu bunun warmup-fazı gürültüsü olduğunu, epoch 3-4 sonrası loss'un düzgün düştüğünü gösterdi. Sonuç: warmup'sız 2-epoch smoke'lar loss eğrisini **okunamaz** kılar. ConsensusLoss Form C bug'ı tam bu yüzden ilk 2-epoch smoke'ta `-0.0042` olarak görünüp kaçabilirdi; 8-epoch + 2-warmup re-smoke onu net negatif trend olarak gösterdi. **Karar: tüm eğitim smoke'ları ≥8 epoch + ≥2 warmup — loss eğrisi gözlemlenebilir olmalı.**
+
+**Teşhis aracı disiplini.** Kampanyada 2 kez (v12 ilk teşhisi, CoMAD teacher teşhisi) bir YOLO modeli `MultiScaleFeatureTap` olmadan düz çağrıldı; tam forward Detect head çıktısı (`[B,84,2100]`) verdi ve yanlış "bug" alarmı üretti. Kütüphane doğruydu, teşhis aracı kusurluydu. Ders: YOLO feature teşhisi her zaman tap üzerinden yapılmalı; düz model çağrısı backbone feature değil head çıktısı verir.
+
+**Reproducibility scaffold.** Colab runtime reset `/content`'i siliyor (kampanya boyunca 3 kez); açılmış havuz + smoke alt-kümesi + SAPS checkpoint kayboluyor. `scripts/smoke_setup.py` (`93a2f6b`) üçünü kalıcı kaynaklarından (Drive part-tar'ları + repo kodu) idempotent yeniden kurar — reset tek-komut kurtarmaya iner.
+
+---
+
+### 10.34 SSL veri havuzu — parçalı arşivleme stratejisi (v9 yeni — Faz 0 build)
+
+SSL pretraining havuzu (181,446 işlenmiş görüntü; BDD100K + Cityscapes + Mapillary + A2D2) 5 ham arşivden (273 GB) inşa edildi. İnşa mimarisi iki kez başarısız oldu, üçüncü stratejiyle oturdu — kayda değer bir lesson:
+
+**Başarısız 1 — havuzu doğrudan Drive'a yazmak.** On binlerce küçük JPEG'i Google Drive mount'una yazmak dramatik yavaş (her dosya ayrı API çağrısı) ve oturum kopmasına açık.
+
+**Başarısız 2 — tek büyük tar.** Havuz hızlı yerel diskte (`/mnt/local-scratch`) inşa edilip tek `.tar` (9.84 GB) olarak Drive'a kopyalandı. Drive senkronizasyonu büyük tek dosyada güvenilmez — `.tar` tam yüklenmeden oturum koparsa kısmi/bozuk dosya kalıyor, ve "yarısı inmiş" durumu programatik tespit edilemiyor.
+
+**Oturmuş strateji — dataset-başına parçalı tar.** Havuz dataset başına ayrı `.tar`'a bölündü (`bdd100k.tar` 4.73 GB, `cityscapes.tar` 1.16 GB, `mapillary.tar` 1.91 GB, `a2d2.tar` 2.03 GB) + ayrı `manifest.parquet`. Her parça Drive'a yazıldıktan **hemen sonra** içeriği doğrulanır (jpg sayısı ↔ manifest). Avantaj: küçük parça = Drive senkronu hızlı ve doğrulanabilir biter; bir parça eksik inerse sadece o yeniden yazılır (318 dakikalık ingest değil); "yarısı inmiş" belirsizliği biter — her parça ya tam ya yok.
+
+**Lesson:** Büyük türetilmiş veri ürünleri (dataset havuzları, cache'ler) için Drive gibi senkronizasyonu asenkron/opak depolara yazarken: (a) çok-küçük-dosya I/O'dan kaçın (arşivle), ama (b) tek dev arşivden de kaçın (parçala) — orta nokta dataset/shard-başına arşiv, her biri yazımdan sonra bütünlük-doğrulamalı. `scripts/build_ssl_pool.py` `--archive-to` ile her dataset sonrası checkpoint-arşivleme yapar.
+
 ---
 
 ## 11. Architecture Sentinels
