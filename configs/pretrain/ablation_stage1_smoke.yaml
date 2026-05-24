@@ -58,7 +58,7 @@ base:
   lr: 1.0e-3
   warmup_epochs: 2
   num_workers: 4
-  print_every: 100
+  print_every: 1
   output_dir: /content/runs/ablation_stage1
 
 # ── Varying axes ────────────────────────────────────────────────────────
