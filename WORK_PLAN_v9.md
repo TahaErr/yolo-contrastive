@@ -461,6 +461,8 @@ checkpoint'i "last epoch" kaydetmesinin zirve-gerisi ağırlık tutmasına yol a
 gösterdi. Düzeltildi (`a87e40f`): checkpoint artık **best-epoch** ağırlıklarını
 kaydeder, `extra` per-epoch `loss_history` taşır (paper Figure 2 verisi).
 
+**⚠ v9 revizyon (pilot sonrası):** Yukarıdaki 3-stage hiyerarşi tablosu özgün plandır — korunur (akademik kayıt). Stage 5.1.1 smoke tamamlandı (`dd014ae`, §5.1 sonucu). Sonraki kademe için: Saf SAPS pilotu (181K/50ep, 9.89h) 3-stage "coarse→fine" yaklaşımının yerine **tek 181K/50ep koşusu** koydu — 50K coarse kademesi atlandı. Backbone kampanyasının tam protokolü §10.31'de. Pilot çıktısı: acc@1 ep43 tepe 0.910.
+
 **Çıktı:** Paper Table 1: "Pure SAPS ablation results". Faz 5.1'in winner config'i Faz 5.2 ve Faz 5.3'ün **baseline argument'i** olur.
 
 #### Faz 5.2 — Multi-backbone validation (yeni — generalization claim)
@@ -1016,6 +1018,18 @@ SSL pretraining havuzu (181,446 işlenmiş görüntü; BDD100K + Cityscapes + Ma
 
 **Lesson:** Büyük türetilmiş veri ürünleri (dataset havuzları, cache'ler) için Drive gibi senkronizasyonu asenkron/opak depolara yazarken: (a) çok-küçük-dosya I/O'dan kaçın (arşivle), ama (b) tek dev arşivden de kaçın (parçala) — orta nokta dataset/shard-başına arşiv, her biri yazımdan sonra bütünlük-doğrulamalı. `scripts/build_ssl_pool.py` `--archive-to` ile her dataset sonrası checkpoint-arşivleme yapar.
 
+### 10.31 Backbone eğitim protokolü — resume + Drive-sync + pilot (v9 yeni)
+
+**Bağlam:** Backbone kampanyası 5 backbone (Saf SAPS, DT-SAPS, SimCLR, MoCo-v3, CoMAD), her biri 181K pool / 50 epoch. Pilot ölçtü: 181K/50ep ≈ **9.89 saat A100** (~700s/epoch). 5 backbone ≈ ~50 saat A100 — tek Colab oturumuna sığmaz, kesinti kaçınılmaz.
+
+**Resume — 5 trainer paritesi.** Beş trainer'ın hepsine epoch-sınırı resume eklendi: DenseSSLPretrainer (`3db44ad`), SimCLR (`cc1702c`), MoCo-v3 (`f45bff3`), CoMAD (`3f35e83`), DualTeacher (`51eca4c`). `train(resume_from=...)`; `save_every` epoch'larında ayrı `.resume.pt` yazılır (trainable + EMA + queue state), temiz bitişte silinir. Resume epoch-sınırında, bit-eşit değil (dataloader reshuffle — SSL için fark ihmal edilebilir). Her trainer'ın state envanteri farklı: SimCLR en sade (model+proj+optimizer), MoCo +EMA encoder/predictor, CoMAD +adapters, DualTeacher en geniş (SAPS makinesi ssl_trainer üzerinden + distill modülleri). Aynı commit'lerde `loss_history` (paper Figure 2 eğrileri) + best-epoch checkpoint de eklendi.
+
+**best-epoch — pilotun kanıtladığı.** Pilot loss/acc@1 **ep43'te tepe** yaptı (acc@1 0.910), ep43-50 arası hafif geriledi (ep50 0.903) — cosine LR ~0'a inerken son epoch'ların drift'i (Stage 1 pooled tail-rise'ın zayıf versiyonu). best-epoch feature olmasa final checkpoint ep50'nin gerilemiş halini kaydederdi; feature sayesinde ep43 ağırlıkları kaydedildi. Baseline'ların da best-epoch kaydetmesi *adil karşılaştırma* için şart — SAPS best-epoch, baseline last-epoch olursa vs-SOTA tablosu SAPS lehine yanlı olurdu.
+
+**Drive-sync mekanizması.** Colab tek-hücre kısıtı: eğitim koşarken ayrı yedekleme hücresi kuyruğa girer, paralel çalışmaz. Çözüm — yedeklemeyi eğitim hücresinin *içine* almak: `threading` ile arka plan thread, her 30 dk `runs/` dizinindeki yeni `.pt`'leri Drive'a kopyalar (mtime karşılaştırması, sadece değişenler). Pilotta kanıtlandı — 9.89 saat boyunca her 30 dk Drive-sync, oturum koparsa son 30 dk'lık checkpoint güvende. Tam koşu sonunda ayrıca `loss_history.json` Drive'a yazılır.
+
+**§5.1 plan revizyonu:** Pilot, §5.1'in eski 3-stage hiyerarşisini (5K smoke → 50K coarse → 186K fine) fiilen değiştirdi — artık tek 181K/50ep koşusu. Bkz §5.1 not.
+
 ---
 
 ## 11. Architecture Sentinels
@@ -1068,12 +1082,15 @@ v2 fix'in gerçek koşullar altında doğrulandığı smoke run. Roboflow 4-clas
 
 ### 11.9 DT-SAPS smoke reference numbers (v9 yeni — Faz 5.3 öncesi placeholder)
 
-Faz 5.3.1 smoke (DT-SAPS, 5K pool, 30 epoch, smoke config) tamamlandığında bu satıra reference numbers eklenecek. Şu an placeholder.
+DT-SAPS smoke (gerçek yolov8n student + gerçek COCO teacher yolov8x + gerçek SSL teacher = SAPS pilot backbone; 5K pool, 4 epoch, imgsz=320, teacher_combo=both, distill_form=B+C, use_disagreement=True) — referans sayılar:
 
-**Beklenen aralık (Faz 5.3.1 smoke için):**
-- `dt_saps_smoke.mAP50`: ≥ Faz 5.1.1 saf SAPS smoke + 0.02 (en az marjinal kazanç olmalı)
-- `learned_w_coco_final`: 0.3 < w < 0.7 (uç değerler → bir teacher tamamen baskın → ablation insight zayıf)
-- `consensus_loss_decay`: monotonic decrease (training healthy)
+- `loss` (toplam): ep1 11.63 → ep2 10.86 (dip) → ep4 11.02. `best_epoch=2`.
+- `saps` bileşeni: ~11.0 düz (4 epoch smoke'ta anlamlı düşüş için çok kısa — SAPS pilotunda da loss ep1-5 yavaş düşüyordu).
+- `distill` bileşeni: ep1 0.347 → ep2 0.050 → ep4 0.027 — hızlı çöküş.
+
+**Smoke ne doğruladı:** pipeline çalışıyor — 5-trainer kompozisyonun en karmaşığı (DenseSSLPretrainer + iki teacher + distillation) gerçek ortamda crash-free; resume + loss_history + best-epoch mekaniği işliyor (`.resume.pt` yazılıp temizlendi, `_ep2.pt` ara checkpoint, `loss_history` saps/distill ayrımıyla).
+
+**Tam koşuda izlenecek (sentinel):** `distill` smoke'ta çok hızlı sıfırlandı (ep4'te 0.027). 181K/50ep tam koşuda `distill` bileşeni ep5-10 civarı sıfırlanıyorsa → distillation sinyali erken tükeniyor; `distill_weight` (şu an 1.0) yetersiz ya da teacher hedefleri öğrenci için fazla kolay demektir. Tam koşunun `loss_history`'sinde saps/distill ayrımına ilk bakılacak şey budur. Smoke bunu *teşhis etmez* (5K ölçeği), sadece pipeline'ı doğrular.
 
 ### 11.10 Multi-backbone consistency sentinel (v9 yeni — Faz 5.2 öncesi placeholder)
 
