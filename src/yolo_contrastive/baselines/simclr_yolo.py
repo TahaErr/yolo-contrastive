@@ -22,10 +22,12 @@ ProjectionHead, NTXentLoss, and the simclr_v2 augmentation preset.
 
 from __future__ import annotations
 
+import copy
 import math
+import os
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -147,8 +149,15 @@ class SimCLRYOLOTrainer:
         output: str = "simclr_yolo_backbone.pt",
         save_every: int = 25,
         print_every: int = 10,
+        resume_from: Optional[str] = None,
     ) -> str:
-        """Run SimCLR pretraining. Returns the saved backbone path."""
+        """Run SimCLR pretraining. Returns the saved backbone path.
+
+        resume_from: path to a ``.resume.pt`` state file (written every
+            ``save_every`` epochs). If given and present, training resumes
+            from the next epoch — model, projection head, optimizer and
+            loss_history are restored. Epoch-boundary granularity.
+        """
         dataset = UnlabeledImageDataset(images_dir, imgsz=self.imgsz)
         dataloader = DataLoader(
             dataset, batch_size=batch_size, shuffle=True,
@@ -171,10 +180,38 @@ class SimCLRYOLOTrainer:
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+        # ── resume state (optional) ──────────────────────────────────────
+        resume_path = output.replace(".pt", ".resume.pt")
+        start_epoch = 1
+        global_step = 0
+        loss_history: list = []
+        best_loss = float("inf")
+        best_epoch = 0
+        best_state = None
+        if resume_from is not None and os.path.exists(resume_from):
+            rs = torch.load(resume_from, map_location=self.device,
+                            weights_only=False)
+            self.model.load_state_dict(rs["model"])
+            self.projection_head.load_state_dict(rs["projection_head"])
+            optimizer.load_state_dict(rs["optimizer"])
+            start_epoch = int(rs["epoch"]) + 1
+            global_step = int(rs["global_step"])
+            loss_history = list(rs.get("loss_history", []))
+            _b = rs.get("best", {})
+            best_loss = _b.get("loss", float("inf"))
+            best_epoch = _b.get("epoch", 0)
+            best_state = _b.get("state", None)
+            with __import__("warnings").catch_warnings():
+                __import__("warnings").simplefilter("ignore")
+                for _ in range(global_step):
+                    scheduler.step()
+            print(f"[simclr-yolo] RESUMED from epoch {rs['epoch']} "
+                  f"→ continuing at epoch {start_epoch}/{epochs}")
+
         self.model.train()
         self.projection_head.train()
 
-        for epoch in range(1, epochs + 1):
+        for epoch in range(start_epoch, epochs + 1):
             t0 = time.time()
             ep_loss = 0.0
             n_batches = 0
@@ -186,29 +223,72 @@ class SimCLRYOLOTrainer:
                 scheduler.step()
                 ep_loss += float(out["loss"].detach())
                 n_batches += 1
+                global_step += 1
 
             n_batches = max(1, n_batches)
+            avg_loss = ep_loss / n_batches
+            loss_history.append({
+                "epoch": epoch, "loss": avg_loss,
+                "lr": float(optimizer.param_groups[0]["lr"]),
+            })
             if print_every and (epoch % print_every == 0 or epoch == 1):
                 print(
                     f"[simclr-yolo] epoch {epoch}/{epochs} "
-                    f"loss={ep_loss / n_batches:.4f} ({time.time() - t0:.1f}s)"
+                    f"loss={avg_loss:.4f} ({time.time() - t0:.1f}s)"
                 )
-            if save_every and epoch % save_every == 0:
-                self._save(output, epoch)
 
-        self._save(output, epochs)
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_epoch = epoch
+                best_state = copy.deepcopy(self.model.state_dict())
+
+            if save_every and epoch % save_every == 0:
+                # resume state FIRST — so a failure in _save() below still
+                # leaves a usable restart point on disk.
+                torch.save({
+                    "model": self.model.state_dict(),
+                    "projection_head": self.projection_head.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch, "global_step": global_step,
+                    "loss_history": loss_history,
+                    "best": {"loss": best_loss, "epoch": best_epoch,
+                             "state": best_state},
+                }, resume_path)
+                # intermediate checkpoint at its own _epN.pt path (kept
+                # separate from the final `output` — same as DenseSSLPretrainer)
+                self._save(output.replace(".pt", f"_ep{epoch}.pt"), epoch)
+
+        # final save — best-epoch weights, full loss_history
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        self._save(output, best_epoch or epochs,
+                   loss_history=loss_history, best_epoch=best_epoch or epochs)
+        if os.path.exists(resume_path):
+            os.remove(resume_path)
         return output
 
     # ── checkpoint ───────────────────────────────────────────────────────
 
-    def _save(self, output: str, epoch: int) -> None:
-        """Save the backbone with a SimCLR-YOLO marker."""
+    def _save(self, output: str, epoch: int,
+              loss_history: Optional[list] = None,
+              best_epoch: Optional[int] = None) -> None:
+        """Save the backbone with a SimCLR-YOLO marker.
+
+        loss_history / best_epoch are passed only by the final save (the
+        per-epoch save_every checkpoints omit them); when present they go
+        into ``extra`` so the learning curve survives the run.
+        """
         Path(output).parent.mkdir(parents=True, exist_ok=True)
+        extra = {"type": "simclr_yolo", "feat_level": self.feat_level}
+        if loss_history is not None:
+            extra["loss_history"] = loss_history
+        if best_epoch is not None:
+            extra["best_epoch"] = best_epoch
         torch.save({
             "model_state_dict": self.model.state_dict(),
             "epoch": epoch,
             "type": "ssl_pretrained",
-            "extra": {"type": "simclr_yolo", "feat_level": self.feat_level},
+            "extra": extra,
         }, output)
 
     # ── lifecycle ────────────────────────────────────────────────────────
