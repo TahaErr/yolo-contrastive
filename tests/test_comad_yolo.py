@@ -301,3 +301,106 @@ class TestTrainSmoke:
         finally:
             tr.cleanup()
             shutil.rmtree(img_dir, ignore_errors=True)
+
+    def test_loss_history_and_best_epoch(self, tmp_path):
+        """train() records per-epoch loss_history; final checkpoint stores
+        best-epoch weights + best_epoch marker."""
+        import shutil
+        img_dir = _dummy_image_dir(n=4, size=64)
+        out = tmp_path / "comad.pt"
+        tr = _make_trainer()
+        try:
+            tr.train(images_dir=img_dir, epochs=3, batch_size=2, lr=1e-3,
+                     warmup_epochs=0, num_workers=0, output=str(out),
+                     save_every=0, print_every=1)
+            ck = torch.load(out, map_location="cpu", weights_only=False)
+            extra = ck["extra"]
+            hist = extra.get("loss_history")
+            assert hist is not None and len(hist) == 3
+            assert [r["epoch"] for r in hist] == [1, 2, 3]
+            assert all("loss" in r and "lr" in r for r in hist)
+            be = extra.get("best_epoch")
+            assert be is not None and 1 <= be <= 3
+            assert ck["epoch"] == be
+            # pre-existing extra keys preserved
+            assert extra["type"] == "comad_yolo"
+            assert extra["n_teachers"] == 3
+        finally:
+            tr.cleanup()
+            shutil.rmtree(img_dir, ignore_errors=True)
+
+    def test_resume_state_written_and_cleaned(self, tmp_path):
+        """save_every writes a .resume.pt; a clean finish deletes it."""
+        import shutil
+        img_dir = _dummy_image_dir(n=4, size=64)
+        out = tmp_path / "comad.pt"
+        resume_path = str(out).replace(".pt", ".resume.pt")
+        tr = _make_trainer()
+        try:
+            tr.train(images_dir=img_dir, epochs=2, batch_size=2, lr=1e-3,
+                     warmup_epochs=0, num_workers=0, output=str(out),
+                     save_every=1, print_every=1)
+            assert not os.path.exists(resume_path), (
+                ".resume.pt should be removed after a clean finish"
+            )
+            assert out.exists()
+        finally:
+            tr.cleanup()
+            shutil.rmtree(img_dir, ignore_errors=True)
+
+    def test_resume_continues_from_checkpoint(self, tmp_path):
+        """Interrupt mid-training (.resume.pt survives), then resume_from
+        continues from the next epoch with the full loss_history.
+
+        CoMAD resume restores the student backbone + teacher adapters
+        (frozen teachers are rebuilt by the constructor, not resumed)."""
+        import shutil
+        from yolo_contrastive.baselines import comad_yolo as _cm
+
+        img_dir = _dummy_image_dir(n=4, size=64)
+        out = tmp_path / "comad.pt"
+        resume_path = str(out).replace(".pt", ".resume.pt")
+        try:
+            real_save = _cm.CoMADYOLOTrainer._save
+            def crashing_save(self, output, epoch, **kw):
+                real_save(self, output, epoch, **kw)
+                if output == str(out):  # final save → crash
+                    raise RuntimeError("simulated crash")
+            tr1 = _make_trainer()
+            crashed = False
+            try:
+                _cm.CoMADYOLOTrainer._save = crashing_save
+                try:
+                    tr1.train(images_dir=img_dir, epochs=2, batch_size=2,
+                              lr=1e-3, warmup_epochs=0, num_workers=0,
+                              output=str(out), save_every=1, print_every=1)
+                except RuntimeError as e:
+                    crashed = "simulated crash" in str(e)
+            finally:
+                _cm.CoMADYOLOTrainer._save = real_save
+                tr1.cleanup()
+
+            assert crashed, "crash simulation did not trigger"
+            assert os.path.exists(resume_path), (
+                ".resume.pt should survive an interrupted run"
+            )
+
+            tr2 = _make_trainer()
+            try:
+                tr2.train(images_dir=img_dir, epochs=4, batch_size=2,
+                          lr=1e-3, warmup_epochs=0, num_workers=0,
+                          output=str(out), save_every=1, print_every=1,
+                          resume_from=resume_path)
+            finally:
+                tr2.cleanup()
+
+            ck = torch.load(out, map_location="cpu", weights_only=False)
+            hist = ck["extra"]["loss_history"]
+            assert [r["epoch"] for r in hist] == [1, 2, 3, 4], (
+                f"loss_history should span 1..4, got {[r['epoch'] for r in hist]}"
+            )
+            assert not os.path.exists(resume_path), (
+                ".resume.pt should be deleted after the resumed run finishes"
+            )
+        finally:
+            shutil.rmtree(img_dir, ignore_errors=True)
