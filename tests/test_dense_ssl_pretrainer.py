@@ -545,6 +545,118 @@ class TestFullTrainSmoke:
             shutil.rmtree(tmp_imgs, ignore_errors=True)
             shutil.rmtree(tmp_out_dir, ignore_errors=True)
 
+    def test_resume_state_written_and_cleaned(self):
+        """save_every epochs write a .resume.pt; a clean finish deletes it."""
+        tmp_imgs = _dummy_images_dir(n=8, size=64)
+        tmp_out_dir = tempfile.mkdtemp(prefix="ycl_dense_resume_")
+        try:
+            output_path = os.path.join(tmp_out_dir, "backbone.pt")
+            resume_path = output_path.replace(".pt", ".resume.pt")
+            tr = _make_trainer()
+            try:
+                tr.train(
+                    images_dir=tmp_imgs, epochs=2, batch_size=2, lr=1e-3,
+                    warmup_epochs=0, num_workers=0, output=output_path,
+                    save_every=1, print_every=1,
+                )
+            finally:
+                tr.cleanup()
+            # clean finish → resume file removed
+            assert not os.path.exists(resume_path), (
+                ".resume.pt should be deleted after a clean finish"
+            )
+            assert os.path.exists(output_path)
+        finally:
+            shutil.rmtree(tmp_imgs, ignore_errors=True)
+            shutil.rmtree(tmp_out_dir, ignore_errors=True)
+
+    def test_resume_continues_from_checkpoint(self):
+        """Interrupt a run mid-training (.resume.pt survives because the
+        clean-finish delete never runs), then train(resume_from=...) and
+        verify it continues from the next epoch with the full loss_history.
+
+        The interruption is simulated by monkeypatching save_backbone to
+        raise after the epoch-2 resume checkpoint is written — this is the
+        suite-level analogue of a real session crash."""
+        import yolo_contrastive.pretrain.dense_trainer as _dt
+
+        tmp_imgs = _dummy_images_dir(n=8, size=64)
+        tmp_out_dir = tempfile.mkdtemp(prefix="ycl_dense_resume_cont_")
+        try:
+            output_path = os.path.join(tmp_out_dir, "backbone.pt")
+            resume_path = output_path.replace(".pt", ".resume.pt")
+
+            # ── phase 1: run with save_every=1, crash after epoch 2 ──
+            # The resume file is written inside the save_every block; we
+            # let epochs 1-2 write it, then raise on the epoch-2 final save
+            # so the clean-finish delete (which removes .resume.pt) is
+            # never reached.
+            real_save = _dt.save_backbone
+            calls = {"n": 0}
+
+            def crashing_save(model, path, **kw):
+                # ara checkpoint'ler "_epN.pt"; final save plain output
+                result = real_save(model, path, **kw)
+                if path == output_path:  # the final save → crash here
+                    raise RuntimeError("simulated session crash")
+                calls["n"] += 1
+                return result
+
+            tr1 = _make_trainer()
+            crashed = False
+            try:
+                _dt.save_backbone = crashing_save
+                try:
+                    tr1.train(
+                        images_dir=tmp_imgs, epochs=2, batch_size=2, lr=1e-3,
+                        warmup_epochs=0, num_workers=0, output=output_path,
+                        save_every=1, print_every=1,
+                    )
+                except RuntimeError as e:
+                    crashed = "simulated session crash" in str(e)
+            finally:
+                _dt.save_backbone = real_save
+                tr1.cleanup()
+
+            assert crashed, "crash simulation did not trigger"
+            # .resume.pt survived — clean-finish delete never ran
+            assert os.path.exists(resume_path), (
+                "resume file should survive an interrupted run"
+            )
+            rs = torch.load(resume_path, map_location="cpu",
+                            weights_only=False)
+            interrupted_epoch = int(rs["epoch"])
+            assert interrupted_epoch >= 1
+            assert len(rs["loss_history"]) == interrupted_epoch
+
+            # ── phase 2: resume → continue to epoch 4 ──
+            tr2 = _make_trainer()
+            try:
+                tr2.train(
+                    images_dir=tmp_imgs, epochs=4, batch_size=2, lr=1e-3,
+                    warmup_epochs=0, num_workers=0, output=output_path,
+                    save_every=1, print_every=1,
+                    resume_from=resume_path,
+                )
+            finally:
+                tr2.cleanup()
+
+            # final checkpoint: loss_history spans ALL epochs 1..4
+            ck = torch.load(output_path, map_location="cpu",
+                            weights_only=False)
+            hist = ck["extra"]["loss_history"]
+            epochs_covered = [r["epoch"] for r in hist]
+            assert epochs_covered == [1, 2, 3, 4], (
+                f"loss_history should span 1..4, got {epochs_covered}"
+            )
+            # clean finish this time → resume file removed
+            assert not os.path.exists(resume_path), (
+                ".resume.pt should be deleted after the resumed run finishes"
+            )
+        finally:
+            shutil.rmtree(tmp_imgs, ignore_errors=True)
+            shutil.rmtree(tmp_out_dir, ignore_errors=True)
+
 
 # ── checkpoint roundtrip ────────────────────────────────────────────────
 

@@ -28,6 +28,7 @@ API parity:
 from __future__ import annotations
 
 import math
+import os
 import time
 import warnings as _warnings
 from typing import Any, Dict, Optional
@@ -429,8 +430,16 @@ class DenseSSLPretrainer:
         output: str = "dense_backbone.pt",
         save_every: int = 25,
         print_every: int = 10,
+        resume_from: Optional[str] = None,
     ) -> str:
         """Run dense SSL pretraining.
+
+        Args:
+            resume_from: Path to a ``.resume.pt`` state file (written every
+                ``save_every`` epochs). If given and the file exists, training
+                resumes from the next epoch — model, optimizer, queues, EMA
+                and loss_history are all restored. Resume is at epoch
+                granularity (dataloader reshuffles); fine for SSL pretraining.
 
         Returns:
             Path to the saved backbone checkpoint.
@@ -517,24 +526,60 @@ class DenseSSLPretrainer:
             except Exception:
                 pass
 
-        # ── loop ────────────────────────────────────────────────────────
+        # ── resume state (optional) ─────────────────────────────────────
+        resume_path = output.replace(".pt", ".resume.pt")
+        start_epoch = 1
         global_step = 0
-        best_loss = float("inf")
+        _resumed_loss_history: list = []
+        _resumed_best = {"loss": float("inf"), "epoch": 0, "state": None}
+        if resume_from is not None and os.path.exists(resume_from):
+            rs = torch.load(resume_from, map_location=self.device,
+                            weights_only=False)
+            self.model.load_state_dict(rs["model"])
+            self.proj_online.load_state_dict(rs["proj_online"])
+            self.momentum.momentum.load_state_dict(rs["momentum_encoder"])
+            self.proj_momentum.load_state_dict(rs["proj_momentum"])
+            for lv, q in self.queues.items():
+                if lv in rs["queues"]:
+                    q.load_state_dict(rs["queues"][lv])
+            optimizer.load_state_dict(rs["optimizer"])
+            start_epoch = int(rs["epoch"]) + 1
+            global_step = int(rs["global_step"])
+            _resumed_loss_history = list(rs.get("loss_history", []))
+            _resumed_best = rs.get("best", _resumed_best)
+            # Fast-forward the scheduler to the resumed step count. Each
+            # scheduler.step() here precedes any optimizer.step() in this
+            # process, which PyTorch warns about — the warning is benign
+            # (LR lands on the correct cosine value, verified) so it is
+            # suppressed. last_epoch>=0 at construction was tried instead
+            # but requires 'initial_lr' in param_groups — more fragile.
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                for _ in range(global_step):
+                    scheduler.step()
+            self._print(
+                f"[ycl-dense] RESUMED from epoch {rs['epoch']} "
+                f"→ continuing at epoch {start_epoch}/{epochs}"
+            )
+
+        # ── loop ────────────────────────────────────────────────────────
+        best_loss = _resumed_best["loss"]
         # Track the weights of the lowest-loss epoch, not just the last.
         # train() runs a cosine LR to ~0; with some queue strategies the last
         # few epochs drift up in loss (Stage 1: pooled tail-rise). Saving the
         # best-epoch weights makes the checkpoint match the reported best_loss.
         import copy as _copy
-        best_state = None
-        best_epoch = 0
+        best_state = _resumed_best["state"]
+        best_epoch = _resumed_best["epoch"]
         # Per-epoch metric history — persisted into the final checkpoint's
         # `extra` so loss curves survive the run (paper Figure 2, plan §5.1).
         # The console print is gated by print_every; this list is not.
-        loss_history: list = []
+        # On resume, prepend the epochs already completed.
+        loss_history: list = list(_resumed_loss_history)
         t0_total = time.time()
 
         try:
-            for epoch in range(1, epochs + 1):
+            for epoch in range(start_epoch, epochs + 1):
                 t0 = time.time()
                 self.model.train()
                 self.proj_online.train()
@@ -634,6 +679,21 @@ class DenseSSLPretrainer:
                     save_backbone(self.model, chkpt, epoch=epoch,
                                   extra={"loss": avg_loss, "type": "dense_ssl"})
                     self._print(f"[ycl-dense] checkpoint: {chkpt}")
+                    # resume state — full restart point at this epoch boundary
+                    torch.save({
+                        "model": self.model.state_dict(),
+                        "proj_online": self.proj_online.state_dict(),
+                        "momentum_encoder": self.momentum.momentum.state_dict(),
+                        "proj_momentum": self.proj_momentum.state_dict(),
+                        "queues": {lv: q.state_dict()
+                                   for lv, q in self.queues.items()},
+                        "optimizer": optimizer.state_dict(),
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "loss_history": loss_history,
+                        "best": {"loss": best_loss, "epoch": best_epoch,
+                                 "state": best_state},
+                    }, resume_path)
 
                 if avg_loss < best_loss:
                     best_loss = avg_loss
@@ -650,6 +710,9 @@ class DenseSSLPretrainer:
                                  "loss_history": loss_history,
                                  "best_epoch": best_epoch or epochs})
             total_time = time.time() - t0_total
+            # training completed cleanly — resume state no longer needed
+            if os.path.exists(resume_path):
+                os.remove(resume_path)
             self._print(
                 f"[ycl-dense] === Done in {total_time:.1f}s | "
                 f"best_loss={best_loss:.4f} @ epoch {best_epoch or epochs} "
