@@ -49,7 +49,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .disagreement import cosine_disagreement
 
 
 def _simple_block(c: int) -> nn.Sequential:
@@ -116,6 +115,48 @@ class MGDDistiller(nn.Module):
     def _uniform_mask(self, b: int, h: int, w: int, device, dtype):
         """Asama 0 — per-position Bernoulli, mask=1 kept with prob (1-lambda)."""
         return (torch.rand(b, 1, h, w, device=device) > self.lambda_mask).to(dtype)
+
+    def _l2_disagreement(
+        self,
+        feat_coco: torch.Tensor,
+        feat_ssl: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Per-position L2 disagreement, per-image min-max normalized.
+
+        Why raw L2 (not cosine): the COCO and SSL teachers occupy different
+        feature-magnitude regimes; their feature *directions* are near-
+        orthogonal almost everywhere (cosine disagreement is a near-flat
+        ~1.0 — measured), so a cosine-based DAMS mask collapses to uniform.
+        The discriminative structure lives in the *magnitude* difference —
+        raw L2 carries it (measured CV ~0.47 on P4/P5 vs cosine's ~0.05).
+
+        Why per-image min-max normalization: raw L2 has extreme outliers
+        (max/mean ~7); a bare softmax over it would let a few extreme
+        positions dominate every mask, killing diversity. Rescaling each
+        image's map to [0, 1] bounds the outliers and keeps tau_mask
+        meaningful across images.
+
+        Args:
+            feat_coco, feat_ssl: ``[B, C, H, W]`` teacher feature maps.
+
+        Returns:
+            ``[B, H, W]`` disagreement in ``[0, 1]`` per image.
+        """
+        if feat_coco.shape != feat_ssl.shape:
+            raise ValueError(
+                f"feat_coco {tuple(feat_coco.shape)} and feat_ssl "
+                f"{tuple(feat_ssl.shape)} must have the same shape"
+            )
+        # raw L2 per position — channel-RMS of the difference
+        d = (feat_coco - feat_ssl).pow(2).mean(dim=1).sqrt()   # [B, H, W]
+        # per-image min-max normalize to [0, 1]
+        b = d.shape[0]
+        flat = d.reshape(b, -1)
+        d_min = flat.min(dim=1, keepdim=True).values
+        d_max = flat.max(dim=1, keepdim=True).values
+        flat = (flat - d_min) / (d_max - d_min + eps)
+        return flat.reshape(d.shape)
 
     def _dams_mask(self, disagreement: torch.Tensor, dtype):
         """Asama 1 — Disagreement-Aware Mask Sampling (non-differentiable).
@@ -186,7 +227,7 @@ class MGDDistiller(nn.Module):
                         f"{tuple(s.shape)} vs {tuple(t_ssl.shape)}"
                     )
                 # DAMS — mask from the teacher disagreement map.
-                d = cosine_disagreement(t_coco, t_ssl)        # [B,H,W]
+                d = self._l2_disagreement(t_coco, t_ssl)       # [B,H,W] in [0,1]
                 mask = self._dams_mask(d, s.dtype)
                 disag_means.append(float(d.mean().detach()))
 
