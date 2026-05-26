@@ -36,7 +36,36 @@ from torch.utils.data import DataLoader
 
 from ..augmentations.presets import build_pipeline
 from ..dense import MultiScaleFeatureTap, MomentumEncoder, infer_in_channels
-from ..pretext.heads import ProjectionHead
+from ..pretext.heads import ProjectionHead  # noqa: F401 (kept for API parity)
+import torch.nn as nn
+
+
+class _LNProjectionHead(nn.Module):
+    """MoCo-v3 MLP head with LayerNorm instead of BatchNorm.
+
+    The shared ProjectionHead (pretext/heads.py) uses BatchNorm1d. The
+    ICLR-2023 MoCo-v3 improvement study found BatchNorm in projection /
+    prediction heads introduces representation instability — correlated
+    with "random failing in training". MoCo v2 reproduced exactly this:
+    a clean ep1-10 descent, then a chaotic ep24-34 rise-and-recover.
+    LayerNorm — batch-statistics-free — removes that failure mode.
+
+    This is a MoCo-specific head: ProjectionHead stays BatchNorm so SimCLR
+    and the other consumers (which trained stably) are untouched.
+    Structure mirrors ProjectionHead: Linear-Norm-ReLU-Linear.
+    """
+
+    def __init__(self, feat_dim: int, out_dim: int = 128, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 from ..pretrain.dataset import UnlabeledImageDataset
 
 _VALID_LEVELS = ("P3", "P4", "P5")
@@ -136,7 +165,7 @@ class MoCoV3YOLOTrainer:
         self.momentum_tap.setup()
 
         # ── projection heads — online (trainable) + momentum (EMA copy) ──
-        self.proj_online = ProjectionHead(
+        self.proj_online = _LNProjectionHead(
             feat_dim=self.feat_dim, out_dim=out_dim, hidden_dim=proj_hidden,
         ).to(self.device)
         self.proj_momentum = copy.deepcopy(self.proj_online).to(self.device)
@@ -147,7 +176,7 @@ class MoCoV3YOLOTrainer:
         # ── prediction head — query branch only (asymmetric) ─────────────
         # A 2-layer MLP out_dim→hidden→out_dim; ProjectionHead's structure
         # (Linear-BN-ReLU-Linear) matches the MoCo-v3 predictor.
-        self.predictor = ProjectionHead(
+        self.predictor = _LNProjectionHead(
             feat_dim=out_dim, out_dim=out_dim, hidden_dim=pred_hidden,
         ).to(self.device)
 
@@ -228,8 +257,14 @@ class MoCoV3YOLOTrainer:
         save_every: int = 25,
         print_every: int = 10,
         resume_from: Optional[str] = None,
+        gradient_clip: Optional[float] = None,
     ) -> str:
         """Run MoCo-v3 pretraining. Returns the saved backbone path.
+
+        gradient_clip: if set, clip the global grad norm to this value
+            after backward, before the optimizer step (torch
+            clip_grad_norm_). MoCo-v3 is prone to sudden gradient
+            spikes / divergence; clipping bounds them. None = no clipping.
 
         resume_from: path to a ``.resume.pt`` state file (written every
             ``save_every`` epochs). If given and present, training resumes
@@ -304,6 +339,14 @@ class MoCoV3YOLOTrainer:
                 optimizer.zero_grad(set_to_none=True)
                 out = self._step(imgs)
                 out["loss"].backward()
+                if gradient_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for g in (self.model.parameters(),
+                                     self.proj_online.parameters(),
+                                     self.predictor.parameters())
+                         for p in g],
+                        max_norm=gradient_clip,
+                    )
                 optimizer.step()
                 scheduler.step()
                 self._ema_update()
