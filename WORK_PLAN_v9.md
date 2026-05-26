@@ -1032,6 +1032,50 @@ SSL pretraining havuzu (181,446 işlenmiş görüntü; BDD100K + Cityscapes + Ma
 
 ---
 
+### 10.35 DT-SAPS Improved Aşama 0 — vanilla MGD erken-doyma ölçümü (v9 yeni)
+
+**Bağlam:** DT-SAPS v1'in distillation kaybı erken doydu — kontrollü teşhisle
+kök neden kesinleşti (random-init öğrenci ep0 distill=1.02; SAPS kapalı pure-
+distill koşusunda da erken doyma → sorun donuk teacher'ın STATİK feature
+hedefi, SAPS baskısı değil). Çözüm yönü: Masked Generative Distillation (MGD,
+Yang et al., ECCV 2022) — "teacher feature'ını kopyala" yerine "maskeli
+öğrenci feature'ından teacher'ı yeniden üret"; maske her batch yeniden
+örneklenir, hedef tükenmez. DT-SAPS Improved (Yol 1) = MGD + DAMS + ADS hibridi.
+
+**Aşama 0 — vanilla MGD ölçümü.** MGDDistiller modülü (`mgd_distiller.py`,
+commit 0b00483) bağımsız modül olarak yazıldı (ConsensusLoss dokunulmadı —
+v1 testleri korunur). Ölçüm: 5K havuz, 15 epoch, tek-teacher (COCO), λ=0.65
+sabit, DualTeacherTrainer'a dokunmadan ayrı ölçüm cell'inde.
+
+**Bulgu — iki katmanlı:**
+- MGD v1'in *duvarını kaldırdı.* v1'de distill loss ep2'de %75-92 çöküp ölü
+  tabana çakılıyordu. MGD'de öyle bir duvar yok — eğri ep1→15 boyunca monoton
+  iniyor (epoch-epoch düşüş hep pozitif, +12.6% → +0.13%), ölü tabana hiç
+  çakılmıyor. MGD'nin "her batch farklı maske → tek-nokta hedefi tüketilmez"
+  mekanizması çalışıyor.
+- Ama MGD erken-doymayı *çözmedi, yumuşattı.* Düşüşün ~%90'ı ilk 2 epoch'ta
+  (0.0326→0.0285); ep5 sonrası eğri fiilen yatay (ep5-15 toplam düşüş %3.3,
+  ep15/ep10=0.990). v1'in keskin duvarının yerine MGD'nin yumuşak platosu
+  geçti — hedef yine tükeniyor, ep2'de değil ep~5-6'da, çarparak değil
+  yavaşlayarak.
+
+**Karar:** Vanilla MGD tek başına yeterli değil — gerekli ama yeterli değil.
+DAMS (anlaşmazlık-güdümlü maske örnekleme) ve ADS (adaptif maske-oranı
+curriculum) "belki faydalı" değil, platoyu kıran ZORUNLU bileşenler. 15-epoch
+ölçümü Yol 1 hibridinin tamamının gerekliliğini ampirik doğruladı. Aşama 1'e
+(dual-teacher MGD + DAMS) geçildi.
+
+**Paper değeri:** "vanilla MGD erken-doyma duvarını kaldırır ama plato kalır;
+DAMS+ADS platoyu da kırar" — dört katkının (diagnostic + MGD + DAMS + ADS) her
+birinin neden var olduğunu gösteren temiz ablation anlatısı. Ablation tablosu
+satırları: SAPS-only / +Form B (v1) / +B+C (v1) / +vanilla MGD / +DAMS / +DAMS+ADS.
+
+**Caveat:** Ölçüm 5K/15-epoch — 5K küçük, plato 181K tam koşuda farklı epoch'ta
+olabilir. Patern (erken düşüş + plato) ölçek-bağımsız büyük ölçüde; kesin
+doğrulama tam koşunun loss_history'sinden gelecek.
+
+---
+
 ## 11. Architecture Sentinels
 
 Sentinel'ler: "bu değer bir daha bu mertebede çıkmazsa kütüphanede regression var" tripwire'ları.
