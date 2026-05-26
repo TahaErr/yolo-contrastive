@@ -1076,6 +1076,100 @@ doğrulama tam koşunun loss_history'sinden gelecek.
 
 ---
 
+### 10.36 DT-SAPS Improved kampanyası — 6 geliştirme, kök-neden teşhisi, negatif sonuç (v9 yeni)
+
+**Bağlam.** DT-SAPS v1 distillation'ı erken doyuyordu (§10.35 öncesi: ep2'de
+%75-92 çöküş + ölü taban; kök neden donuk teacher'ın STATİK feature hedefi).
+DT-SAPS Improved (Yol 1 = MGD + DAMS + ADS hibridi) bunu çözmek için
+tasarlandı. Aşağıda 6 geliştirme adımı, her biri ölçülmüş, kronolojik.
+Ölçüm protokolü ortak: 5K havuz, 15 epoch (λ-taraması 10), dual-teacher
+(COCO yolov8x + SSL=SAPS pilot), öğrenci yolov8n.
+
+**1 — Vanilla MGD (Aşama 0).** Form B/C yerine maskeli üretim (öğrenci
+feature'ının λ'sı maskeli → generator teacher feature'ını yeniden üretir),
+λ=0.65 sabit, tek-teacher. Sonuç: v1'in ep2-DUVARINI kaldırdı — loss ep1→15
+monoton iniyor, ölü tabana çakılmıyor. AMA ep5 sonrası yumuşak plato kaldı
+(ep15/ep10=0.990). Her-batch-farklı-maske hedefi tüketilmez yaptı ama
+tek-nokta yeniden-üretim görevi yine ep5'te doyuyor.
+
+**2 — DAMS / cosine disagreement.** Maske uniform yerine iki teacher'ın
+cosine-anlaşmazlık haritasından örnenir. Sonuç: platoyu KIRMADI; disag 15
+epoch sabit ~1.0038. Teşhis: COCO/SSL teacher feature YÖNLERİ her yerde
+ortogonal (cosine CV ~0.05-0.12) — anlaşmazlık haritası düz, DAMS uniform
+maskeye çöktü.
+
+**3 — DAMS / ham L2 disagreement.** Metrik cosine→ham L2 + per-image
+min-max norm (yapı magnitude'de — anlaşmazlık haritası teşhisi: L2 CV
+~0.24-0.47 yapılı, cosine/norm-L2 düz). Sonuç: platoyu KIRMADI; disag yine
+sabit 0.1545. Kök neden: L2 haritası YAPILI ama STATİK — iki teacher donuk,
+anlaşmazlık öğrenciye bağlı değil; statik maske kaynağı = başka bir statik
+hedef, öğrenci yetişince plato yine oluşur.
+
+**4 — RAMS (Reconstruction-Adaptive Mask Sampling).** Maske sinyali
+teacher-anlaşmazlığı yerine öğrencinin kendi reconstruction hatası
+(max(err_coco, err_ssl), EMA-hafızalı — geçmiş hata, m=0.9). Reconstruction
+teşhisi: sinyal hem yapılı (CV~0.35) hem dinamik (sıralama-korelasyon
+0.55-0.72 — "en kötü" pozisyonlar kayıyor). Sonuç: platoyu KIRMADI
+(ep10→15 %1.28); ama recon_err eğitim boyunca HAREKET ETTİ — sinyal
+gerçekten dinamikti. Bulgu: dinamik sinyal bile platoyu kırmıyor — sorun
+maske KONUMU değil.
+
+**5 — λ-taraması.** RAMS sabit, λ∈(0.5, 0.65, 0.8), adil karşılaştırma
+(aynı seed). Sonuç: plato λ'ya DUYARSIZ — geç-düşüş yelpazesi %1.27. Üstelik
+λ↑ geç-düşüşü hafifçe KÖTÜLEŞTİRİYOR (λ=0.5 %3.58 → λ=0.8 %2.31). Maske
+ORANI da kök neden değil; yüksek maske öğrenmeyi sürdürmüyor, erken doygunluk
+veriyor.
+
+**6 — Plato gerçekliği + generator teşhisleri (kök neden).**
+  (a) Plato gerçek mi: ep5 ve ep15 backbone snapshot, pothole görüntülerinde
+      CKA. CKA(ep5,ep15)=0.999, efektif rank değişimi ±0.1% → backbone ep5'te
+      FİİLEN DONMUŞ. Plato distill-loss artefaktı değil, gerçek öğrenme
+      durması.
+  (b) Generator kapasitesi: derin generator (4-conv+residual) vs sığ (2-conv
+      MGD simple block). Derin generator platoyu KIRMADI — sadece daha yüksek
+      bir seviyeden daha yavaş yakınsadı (ep10'da hâlâ 0.046, sığ 0.029).
+      Kapasite kök neden değil.
+  (c) Generator-baypas: generator'ı tümden kaldır (saf öğrenci→teacher MSE
+      feature imitation). Generator'lı ve generator'sız kurulum AYNI: öğrenci
+      donuyor, R² ~0.27'de tavan. Generator baypas etmiyordu.
+
+**KÖK NEDEN.** Öğrenci→COCO-teacher lineer açıklanabilirlik (R²) ep5'te 0.27,
+ep15'te hâlâ 0.27 — kazanç sıfır. Saf feature imitation'da bile öyle. Bir
+yolov8n SSL öğrencisi, yolov8x COCO-supervised teacher feature uzayının
+%73'ünü lineer olarak BİLE temsil edemiyor — ve temsil edebildiği %27'yi ep5'te
+alıp orada kalıyor. Plato bir mekanizma kusuru değil; öğrenci-teacher TEMSİL
+UYUMSUZLUĞUNUN ölçüsü. 8 bağımsız geliştirme (4 maske varyantı, 3 λ, generator
+derinliği) hepsi maske/oran/generator tarafını ayarladı — kök neden ise frozen
+heterojen-teacher feature distillation'ının kendisinde.
+
+**METOD ÖZETİ — neden işe yaramadı:**
+
+| # | Metod | Sonuç (ep10→15 / kanıt) | Neden işe yaramadı |
+|---|---|---|---|
+| 1 | Vanilla MGD | duvar kalktı, plato kaldı (%0.97) | tek-nokta yeniden-üretim görevi ep5'te doyuyor |
+| 2 | DAMS cosine | kırmadı; disag sabit ~1.0 | teacher yönleri her yerde ortogonal — harita düz, maske uniform'a çöktü |
+| 3 | DAMS L2 | kırmadı; disag sabit 0.15 | harita yapılı ama statik — donuk teacher, öğrenciden bağımsız |
+| 4 | RAMS | kırmadı (%1.28); sinyal dinamik | sorun maske konumu değil — dinamik sinyal bile kırmıyor |
+| 5 | λ-taraması | duyarsız (%1.27 yelpaze) | maske oranı kök neden değil; λ↑ erken doygunluğu artırıyor |
+| 6 | derin generator | kırmadı; daha yavaş yakınsama | generator kapasitesi değil |
+| 6 | generator-baypas testi | generator'lı=generator'sız | generator suçlu değil |
+| — | **KÖK NEDEN** | öğrenci→teacher R² 0.27'de tavan | yolov8n öğrenci, yolov8x teacher feature'ının %73'ünü temsil edemiyor — temsil uyumsuzluğu |
+
+**Karar.** DT-SAPS Improved mevcut haliyle pozitif sonuç veremez — frozen
+heterojen-teacher feature distillation bu öğrenci-teacher çiftinde yapısal
+olarak doymuş. Bir sonraki adım: DT-SAPS yerine yeni bir metod. Korunan
+varlık: bu 8-deney teşhis zinciri + DT-SAPS v1 erken-doyma teşhisi —
+"frozen heterojen-teacher distillation SSL pretraining'de neden başarısız"
+güçlü bir diagnostic katkı (paper'ın en sağlam asset'i, WACV/BMVC/TIP).
+
+**Caveat.** Tüm ölçümler 5K/15-epoch. Patern (ep5 plato, R² 0.27 tavanı)
+8 deneyde tutarlı — ölçek-bağımsız büyük ölçüde. Tek test edilmemiş teknik
+varyant: öğrenciye yakın ölçekli teacher (yolov8s) — uyumsuzluğu azaltabilir
+ama DT-SAPS'ın "güçlü denetimli teacher" değer önermesini zayıflatır; yeni
+metod arayışında değerlendirilecek.
+
+---
+
 ## 11. Architecture Sentinels
 
 Sentinel'ler: "bu değer bir daha bu mertebede çıkmazsa kütüphanede regression var" tripwire'ları.
