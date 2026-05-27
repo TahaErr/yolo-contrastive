@@ -39,13 +39,18 @@ class NaturalPairMatcher:
             Default 0.7 — tipik SSL similarity-bootstrapping aralığı.
     """
 
-    def __init__(self, similarity_threshold: float = 0.7):
+    def __init__(
+        self,
+        similarity_threshold: float = 0.7,
+        stratify_by_scale_pair: bool = False,
+    ):
         if not (-1.0 <= similarity_threshold <= 1.0):
             raise ValueError(
                 f"similarity_threshold ∈ [-1, 1] olmalı, alındı: "
                 f"{similarity_threshold}"
             )
         self.similarity_threshold = similarity_threshold
+        self.stratify_by_scale_pair = stratify_by_scale_pair
 
     def match(
         self,
@@ -94,13 +99,18 @@ class NaturalPairMatcher:
 
         # Aday maskesi: aynı görüntü + farklı ölçek + i != j
         same_image = image_ids.unsqueeze(0) == image_ids.unsqueeze(1)   # [N, N]
-        same_scale = (
-            log_scales.squeeze(1).unsqueeze(0)
-            == log_scales.squeeze(1).unsqueeze(1)
-        )                                                                # [N, N]
+        log_scale_col = log_scales.squeeze(1)
+        same_scale = log_scale_col.unsqueeze(0) == log_scale_col.unsqueeze(1)
         diff_scale = ~same_scale
         diagonal = torch.eye(N, dtype=torch.bool, device=ema_features.device)
-        valid = same_image & diff_scale & ~diagonal                      # [N, N]
+        base_valid = same_image & diff_scale & ~diagonal                 # [N, N]
+
+        if self.stratify_by_scale_pair:
+            return self._match_stratified(
+                sim, base_valid, log_scale_col, log_scales, ema_features
+            )
+
+        valid = base_valid                                               # [N, N]
 
         # Geçersiz adayları -inf yap (argmax filtrelensin)
         masked_sim = sim.masked_fill(~valid, float("-inf"))
@@ -131,6 +141,76 @@ class NaturalPairMatcher:
         idx_b = idx_b_all[keep]
 
         # log_ratio = log(scale_b / scale_a) = log_scale_b - log_scale_a
+        log_r = (log_scales[idx_b] - log_scales[idx_a]).squeeze(1)
+
+        return idx_a, idx_b, log_r
+
+    def _match_stratified(
+        self,
+        sim: torch.Tensor,
+        base_valid: torch.Tensor,
+        log_scale_col: torch.Tensor,
+        log_scales: torch.Tensor,
+        ema_features: torch.Tensor,
+    ):
+        """Scale-pair-stratified matching: her benzersiz (s_a, s_b) çifti için
+        ayrı karşılıklı en-yakın-komşu eşleştirmesi yap; sonuçları birleştir.
+
+        Sebebi: karşılıklı en-yakın doğal olarak "kolay" (yakın-ölçek)
+        çiftleri tercih ediyor — log_r dağılımı bozuk oluyor (örn. 14 çiftin
+        6'sı tek bir log_r'de). Stratified mod log_r dağılımını uniform yapar:
+        her olası ölçek çiftinden bağımsız eşleşmeler toplanır.
+        """
+        N = ema_features.shape[0]
+        device = ema_features.device
+
+        unique_scales = torch.unique(log_scale_col)
+        all_idx_a = []
+        all_idx_b = []
+
+        # Tüm benzersiz (s_a, s_b) çiftleri, s_a < s_b (her çift bir kez)
+        for i in range(len(unique_scales)):
+            for j in range(i + 1, len(unique_scales)):
+                s_a, s_b = unique_scales[i], unique_scales[j]
+                # Bu özel ölçek çifti için maske
+                is_s_a = log_scale_col == s_a   # [N]
+                is_s_b = log_scale_col == s_b   # [N]
+                # row in s_a, col in s_b — bu yön için karşılıklı en-yakın
+                pair_mask = is_s_a.unsqueeze(1) & is_s_b.unsqueeze(0)   # [N, N]
+                pair_mask = pair_mask & base_valid                       # [N, N]
+
+                if not pair_mask.any():
+                    continue
+
+                # Bu submask altında karşılıklı en-yakın bul
+                masked_sim = sim.masked_fill(~pair_mask, float("-inf"))
+                # Her s_a satırı için en yakın s_b sütunu
+                best_b_for_a = masked_sim.argmax(dim=1)     # [N]
+                best_score_a = masked_sim.gather(1, best_b_for_a.unsqueeze(1)).squeeze(1)
+                # Her s_b sütunu için en yakın s_a satırı (transpose ile)
+                masked_sim_T = sim.t().masked_fill(~pair_mask.t(), float("-inf"))
+                best_a_for_b = masked_sim_T.argmax(dim=1)   # [N]
+
+                # Karşılıklılık: i'nin en yakını j, j'nin en yakını da i
+                # AYRICA: benzerlik eşik üstü olmalı
+                row_indices = torch.arange(N, device=device)
+                mutual = (best_a_for_b[best_b_for_a] == row_indices)
+                has_neighbor = best_score_a > float("-inf")
+                eligible = mutual & has_neighbor & (best_score_a >= self.similarity_threshold)
+                # Yalnız s_a olan satırlardan başla (is_s_a True ve mutual)
+                eligible = eligible & is_s_a
+
+                if eligible.any():
+                    idx_a_pair = row_indices[eligible]
+                    idx_b_pair = best_b_for_a[eligible]
+                    all_idx_a.append(idx_a_pair)
+                    all_idx_b.append(idx_b_pair)
+
+        if not all_idx_a:
+            return None
+
+        idx_a = torch.cat(all_idx_a)
+        idx_b = torch.cat(all_idx_b)
         log_r = (log_scales[idx_b] - log_scales[idx_a]).squeeze(1)
 
         return idx_a, idx_b, log_r

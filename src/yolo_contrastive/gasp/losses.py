@@ -274,3 +274,223 @@ def feature_regularization_loss(
     covariance_loss = (cov[off_diag_mask] ** 2).sum() / D
 
     return {"variance": variance_loss, "covariance": covariance_loss}
+
+
+
+def controlled_loss_F(
+    patches: torch.Tensor,
+    encoder,
+    transform,
+    scale_a: float,
+    scale_b: float,
+    target_patch_size: int,
+    candidate_log_ratios: torch.Tensor = None,
+    temperature: float = 0.2,
+    augment: bool = True,
+) -> dict:
+    """L_kontrollü_F — sahte-dönüşüm-aware controlled loss (GASP §10.37).
+
+    log_r üzerinde InfoNCE: T uygulandığında f_b'ye en çok yaklaşan log_r
+    GERÇEK log_r olmalı; sahte log_r adayları daha uzak vermeli. Bu, T'nin
+    log_r'nin gerçek bir fonksiyonu olduğunu öğrenmesini zorlar (EquiMod'un
+    T=identity'ye çökme tuzağının doğrudan adresi).
+
+    Formülasyon:
+        d_k = ||T(f_a, log_r_k) - f_b||²
+        L = -log[ exp(-d_real/τ) / Σ_k exp(-d_k/τ) ]
+
+    Args:
+        patches: [N, 3, P, P] giriş yamaları.
+        encoder: yama → feature ([N,3,Q,Q] → [N, D]).
+        transform: ScaleEquivariantTransform.
+        scale_a, scale_b: iki augment'ın ölçek faktörleri (gerçek log_r =
+            log(scale_b / scale_a)).
+        target_patch_size: encoder'a verilecek boyut.
+        candidate_log_ratios: [K] sahte log_r adayları. None ise YALNIZ
+            gerçek log_r kullanılır (L2 fallback, ablation için).
+        temperature: InfoNCE sıcaklığı (default 0.2, SimCLR aralığında).
+        augment: True ise renk-jitter + blur (kontrollü-hile savunması).
+
+    Returns:
+        {"loss": skaler, "mse_real": float, "log_ratio_real": float,
+         "n_candidates": int}
+    """
+    if patches.dim() != 4 or patches.shape[1] != 3:
+        raise ValueError(f"patches [N,3,P,P] olmalı, alındı: {tuple(patches.shape)}")
+    if scale_a <= 0 or scale_b <= 0:
+        raise ValueError(f"scales > 0 olmalı, alındı: {scale_a}, {scale_b}")
+    if temperature <= 0:
+        raise ValueError(f"temperature > 0 olmalı, alındı: {temperature}")
+
+    import math
+    N = patches.shape[0]
+    device = patches.device
+
+    # İki augment
+    if augment:
+        view_a = _augment_patch(patches, target_patch_size)
+        view_b = _augment_patch(patches, target_patch_size)
+    else:
+        view_a = F.interpolate(patches, size=(target_patch_size, target_patch_size),
+                                mode="bilinear", align_corners=False)
+        view_b = view_a
+
+    f_a = encoder(view_a)   # [N, D]
+    f_b = encoder(view_b)   # [N, D]
+
+    # Gerçek log_r
+    log_ratio_real = math.log(scale_b / scale_a)
+
+    # Aday log_r set: gerçek + sahteler (eğer verildiyse)
+    if candidate_log_ratios is None or candidate_log_ratios.numel() == 0:
+        # Fallback: yalnız gerçek → L2 MSE (sadece smoke için)
+        log_r = torch.full((N, 1), log_ratio_real, device=device, dtype=f_a.dtype)
+        f_a_T = transform(f_a, log_r)
+        mse = F.mse_loss(f_a_T, f_b)
+        return {
+            "loss": mse,
+            "mse_real": float(mse.detach()),
+            "log_ratio_real": log_ratio_real,
+            "n_candidates": 1,
+        }
+
+    # Aday set: real önce, sonra sahteler. İlk indeks = real.
+    candidates = candidate_log_ratios.to(device=device, dtype=f_a.dtype)   # [K_other]
+    real_t = torch.tensor([log_ratio_real], device=device, dtype=f_a.dtype)
+    all_log_r = torch.cat([real_t, candidates], dim=0)   # [K_total], real ilk
+    K = all_log_r.shape[0]
+
+    # Her aday için d_k = ||T(f_a, log_r_k) - f_b||² (örnek bazlı ortalama)
+    # Vectorize: T'yi K kez çağır, yığınla
+    # f_a [N, D], log_r [N, 1] aldığı için, K aday için K kez çağırırız.
+    # Daha verimli: tile f_a → [N*K, D], log_r broadcast → [N*K, 1]
+    f_a_tiled = f_a.unsqueeze(0).expand(K, N, -1).reshape(K * N, -1)   # [K*N, D]
+    log_r_tiled = all_log_r.unsqueeze(1).expand(K, N).reshape(K * N, 1)
+    f_a_T = transform(f_a_tiled, log_r_tiled)   # [K*N, D]
+    f_a_T = f_a_T.reshape(K, N, -1)              # [K, N, D]
+    # Her aday için MSE (per-sample, sonra batch ortalama):
+    f_b_exp = f_b.unsqueeze(0).expand(K, N, -1)   # [K, N, D]
+    d_k = ((f_a_T - f_b_exp) ** 2).mean(dim=-1)   # [K, N] — per-sample distance
+
+    # InfoNCE: gerçek (k=0) en küçük d olmalı
+    # logits = -d_k / temperature, softmax → "doğru log_r seçilsin"
+    logits = -d_k / temperature           # [K, N]
+    # Cross-entropy: target = 0 (real first)
+    log_probs = F.log_softmax(logits, dim=0)   # softmax over candidates per sample
+    loss = -log_probs[0].mean()           # L = -log p(real) ortalama
+
+    mse_real = float(d_k[0].mean().detach())
+
+    return {
+        "loss": loss,
+        "mse_real": mse_real,
+        "log_ratio_real": log_ratio_real,
+        "n_candidates": K,
+    }
+
+
+
+def natural_loss_F(
+    online_features: torch.Tensor,
+    ema_features: torch.Tensor,
+    log_scales: torch.Tensor,
+    image_ids: torch.Tensor,
+    matcher,
+    transform,
+    candidate_log_ratios: torch.Tensor = None,
+    temperature: float = 0.2,
+) -> dict:
+    """L_doğal_F — sahte-dönüşüm-aware natural loss (GASP §10.37).
+
+    EMA-eşleştirilmiş çiftler için log_r üzerinde InfoNCE. Her eşleşen
+    çiftin (idx_a_i, idx_b_i, log_r_i) gerçek log_r_i'si var; sahte
+    adaylar = scales'tan teorik üretilen TÜM OLASI log_r değerleri
+    (eşleşmelerden değil — eşleşmelerde duplikat olur, InfoNCE softmax
+    duplikatları ayırt edemez). Symmetric uygulama: hem T(f_a, +log_r) →
+    f_b, hem T(f_b, -log_r) → f_a yönü eşit ağırlıkla InfoNCE.
+
+    Args:
+        online_features: [N, D] öğrenci feature (gradient akar).
+        ema_features: [N, D] EMA-teacher feature (eşleştirme için).
+        log_scales, image_ids: sampler'dan.
+        matcher: NaturalPairMatcher.
+        transform: ScaleEquivariantTransform.
+        temperature: InfoNCE sıcaklığı (default 0.2).
+
+    Returns:
+        {"loss": skaler, "n_pairs": int, "mse_real": float}
+    """
+    if online_features.dim() != 2:
+        raise ValueError(f"online_features [N, D] olmalı, alındı: {tuple(online_features.shape)}")
+    if online_features.shape != ema_features.shape:
+        raise ValueError(f"online {online_features.shape} ve ema {ema_features.shape} eşit değil")
+    if temperature <= 0:
+        raise ValueError(f"temperature > 0 olmalı, alındı: {temperature}")
+
+    device = online_features.device
+    dtype = online_features.dtype
+
+    match_out = matcher.match(ema_features, log_scales, image_ids)
+    if match_out is None:
+        zero = torch.zeros((), device=device, dtype=dtype)
+        return {"loss": zero, "n_pairs": 0, "mse_real": 0.0}
+
+    idx_a, idx_b, log_r = match_out
+    M = idx_a.numel()
+
+    # Fallback: tek eşleşme varsa InfoNCE anlamsız (K=1), L2 davran
+    if M < 2:
+        log_r_col = log_r.unsqueeze(1)
+        f_a = online_features[idx_a]
+        f_b = online_features[idx_b]
+        f_a_T = transform(f_a, log_r_col)
+        f_b_T = transform(f_b, -log_r_col)
+        mse = 0.5 * (F.mse_loss(f_a_T, f_b) + F.mse_loss(f_b_T, f_a))
+        return {"loss": mse, "n_pairs": M, "mse_real": float(mse.detach())}
+
+    # Aday log_r seti: scales'tan üretilen TÜM olası log_r'ler
+    # (candidate_log_ratios). Eğer verilmemişse, eşleşmelerden benzersiz
+    # alarak fallback (eski mantık, duplikat riski var).
+    f_a = online_features[idx_a]                # [M, D]
+    f_b = online_features[idx_b]                # [M, D]
+
+    if candidate_log_ratios is not None and candidate_log_ratios.numel() > 0:
+        all_log_r = candidate_log_ratios.to(device=device, dtype=f_a.dtype)
+    else:
+        # Fallback: eşleşmelerden benzersiz log_r'ler
+        all_log_r = torch.unique(log_r)
+    K = all_log_r.shape[0]
+
+    # Her çift için "doğru" log_r index'i: aday set'te real_log_r'ye en yakın
+    # (genellikle birebir eşleşir; numerik tolerans için argmin)
+    # all_log_r [K], log_r [M]: dist matrix [K, M]
+    dist_to_candidates = (all_log_r.unsqueeze(1) - log_r.unsqueeze(0)).abs()
+    target = dist_to_candidates.argmin(dim=0)   # [M] her çiftin aday-set indexi
+
+    # ── Forward yön: T(f_a, log_r_k) ≈ f_b ──
+    # K aday × M çift için T(f_a, log_r_k): tile f_a → [K*M, D]
+    f_a_tiled = f_a.unsqueeze(0).expand(K, M, -1).reshape(K * M, -1)
+    log_r_tiled = all_log_r.unsqueeze(1).expand(K, M).reshape(K * M, 1)
+    f_a_T = transform(f_a_tiled, log_r_tiled).reshape(K, M, -1)
+    f_b_exp = f_b.unsqueeze(0).expand(K, M, -1)
+    d_fwd = ((f_a_T - f_b_exp) ** 2).mean(dim=-1)   # [K, M]
+    logits_fwd = -d_fwd / temperature
+    log_probs_fwd = F.log_softmax(logits_fwd, dim=0)
+    loss_fwd = -log_probs_fwd[target, torch.arange(M, device=device)].mean()
+
+    # ── Backward yön: T(f_b, -log_r_k) ≈ f_a ──
+    neg_log_r_tiled = -all_log_r.unsqueeze(1).expand(K, M).reshape(K * M, 1)
+    f_b_tiled = f_b.unsqueeze(0).expand(K, M, -1).reshape(K * M, -1)
+    f_b_T = transform(f_b_tiled, neg_log_r_tiled).reshape(K, M, -1)
+    f_a_exp = f_a.unsqueeze(0).expand(K, M, -1)
+    d_bwd = ((f_b_T - f_a_exp) ** 2).mean(dim=-1)
+    logits_bwd = -d_bwd / temperature
+    log_probs_bwd = F.log_softmax(logits_bwd, dim=0)
+    # Backward yönde "doğru" -log_r için: -all_log_r[target] ≈ -log_r[m]
+    # Yani target aynı kalır (negation symmetric)
+    loss_bwd = -log_probs_bwd[target, torch.arange(M, device=device)].mean()
+
+    loss = 0.5 * (loss_fwd + loss_bwd)
+    mse_real = float(d_fwd[target, torch.arange(M, device=device)].mean().detach())
+
+    return {"loss": loss, "n_pairs": M, "mse_real": mse_real}

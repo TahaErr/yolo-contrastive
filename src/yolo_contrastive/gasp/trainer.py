@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 from .transform import ScaleEquivariantTransform
 from .patch_sampler import MultiScalePatchSampler
 from .natural_pair import NaturalPairMatcher
-from .losses import controlled_loss, natural_loss, feature_regularization_loss
+from .losses import controlled_loss, natural_loss, feature_regularization_loss, controlled_loss_F, natural_loss_F
 from ..dense.multi_scale_tap import MultiScaleFeatureTap
 
 
@@ -66,8 +66,10 @@ class GASPTrainer:
         patch_size: int = 64,
         target_patch_size: int = 64,
         alpha: float = 1.0,
-        lambda_var: float = 25.0,
-        lambda_cov: float = 1.0,
+        loss_variant: str = "F",
+        temperature: float = 0.2,
+        lambda_var: float = 0.0,
+        lambda_cov: float = 0.0,
         variance_target: float = 1.0,
         momentum: float = 0.99,
         similarity_threshold: float = 0.7,
@@ -83,6 +85,10 @@ class GASPTrainer:
         self.device = device
         self.feat_dim = feat_dim
         self.alpha = alpha
+        if loss_variant not in ("F", "vanilla"):
+            raise ValueError(f"loss_variant 'F' veya 'vanilla' olmalı, alındı: {loss_variant}")
+        self.loss_variant = loss_variant
+        self.temperature = temperature
         self.lambda_var = lambda_var
         self.lambda_cov = lambda_cov
         self.variance_target = variance_target
@@ -129,14 +135,20 @@ class GASPTrainer:
             patches_per_scale=patches_per_scale,
             patch_size=patch_size,
         )
+        # F variant için scale-pair-stratified matching: log_r dağılımını
+        # uniform yapar; karşılıklı en-yakın'ın "kolay çift" eğilimini düzeltir.
+        # Vanilla variant: eski davranış (stratify=False).
         self.matcher = NaturalPairMatcher(
             similarity_threshold=similarity_threshold,
+            stratify_by_scale_pair=(loss_variant == "F"),
         )
 
-        # ScaleA, scaleB — controlled_loss için. Sampler scales'ından ilk iki
-        # (genelde küçük ve büyük). Tek scale verilirse self-self.
-        self._scale_a = self.scales[0]
-        self._scale_b = self.scales[-1] if len(self.scales) > 1 else self.scales[0]
+        # Sampler'dan gelen scales — her batch'te rastgele iki ölçek seçilir
+        # (controlled_loss_F için). Tek scale verilirse self-self.
+        if len(self.scales) < 2:
+            self._scale_a = self.scales[0]
+            self._scale_b = self.scales[0]
+        # Çoklu scale durumunda dinamik seçim _step içinde yapılır.
 
         self.loss_history: list = []
 
@@ -184,30 +196,77 @@ class GASPTrainer:
         log_scales = log_scales.to(self.device)
         image_ids = image_ids.to(self.device)
 
-        # L_kontrollü — encoder fonksiyonu olarak self._encode kullan
-        # patches doğrudan controlled_loss'a giriyor; o iki kez augment edip
-        # encoder'ı iki kez çağırıyor
-        ctrl_out = controlled_loss(
-            patches=patches,
-            encoder=lambda x: self._encode(x, use_ema=False),
-            transform=self.transform,
-            scale_a=self._scale_a,
-            scale_b=self._scale_b,
-            target_patch_size=self.target_patch_size,
-        )
+        # Dinamik scale seçimi: her batch'te self.scales'tan rastgele iki tane
+        # (controlled_loss_F için çeşitlilik kaynağı; tek-çift durumunda fallback)
+        import random, math
+        if len(self.scales) >= 2:
+            scale_a, scale_b = random.sample(list(self.scales), 2)
+        else:
+            scale_a = scale_b = self.scales[0]
 
-        # L_doğal — online + EMA features hesapla, eşleştir, T tutarlılığı
-        # Hem online hem EMA aynı yamalar üzerinde çalışır
+        # L_kontrollü_F için sahte log_r adayları: self.scales içindeki
+        # tüm olası çiftlerin log_r değerleri (çeşitli, "gerçek olabilirdi" değerler)
+        candidate_log_ratios_ctrl = None
+        if self.loss_variant == "F" and len(self.scales) >= 3:
+            all_pairs = [(sa, sb) for sa in self.scales for sb in self.scales if sa != sb]
+            candidate_log_ratios_ctrl = torch.tensor(
+                [math.log(sb / sa) for sa, sb in all_pairs],
+                device=self.device,
+            )
+
+        if self.loss_variant == "F":
+            ctrl_out = controlled_loss_F(
+                patches=patches,
+                encoder=lambda x: self._encode(x, use_ema=False),
+                transform=self.transform,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                target_patch_size=self.target_patch_size,
+                candidate_log_ratios=candidate_log_ratios_ctrl,
+                temperature=self.temperature,
+            )
+        else:
+            ctrl_out = controlled_loss(
+                patches=patches,
+                encoder=lambda x: self._encode(x, use_ema=False),
+                transform=self.transform,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                target_patch_size=self.target_patch_size,
+            )
+
+        # L_doğal — F varyantı: InfoNCE on log_r; vanilla: symmetric L2
         online_feats = self._encode(patches, use_ema=False)
         ema_feats = self._encode(patches, use_ema=True)
-        nat_out = natural_loss(
-            online_features=online_feats,
-            ema_features=ema_feats,
-            log_scales=log_scales,
-            image_ids=image_ids,
-            matcher=self.matcher,
-            transform=self.transform,
-        )
+        if self.loss_variant == "F":
+            # Aday log_r set: tüm olası scale çiftleri (ctrl ile aynı set).
+            # Hem +log_r hem -log_r olası yönlerini içersin (symmetric).
+            nat_candidates = candidate_log_ratios_ctrl
+            if nat_candidates is None and len(self.scales) >= 2:
+                all_pairs = [(sa, sb) for sa in self.scales for sb in self.scales if sa != sb]
+                nat_candidates = torch.tensor(
+                    [math.log(sb / sa) for sa, sb in all_pairs],
+                    device=self.device,
+                )
+            nat_out = natural_loss_F(
+                online_features=online_feats,
+                ema_features=ema_feats,
+                log_scales=log_scales,
+                image_ids=image_ids,
+                matcher=self.matcher,
+                transform=self.transform,
+                candidate_log_ratios=nat_candidates,
+                temperature=self.temperature,
+            )
+        else:
+            nat_out = natural_loss(
+                online_features=online_feats,
+                ema_features=ema_feats,
+                log_scales=log_scales,
+                image_ids=image_ids,
+                matcher=self.matcher,
+                transform=self.transform,
+            )
 
         # VICReg-style feature düzenleyici — kollaps engeli.
         # GASP'ın "bilgi koruma" şartı; T tabanlı tutarlılıkla birlikte
