@@ -14,28 +14,36 @@ from PIL import Image
 from yolo_contrastive.gasp import GASPTrainer
 
 
-def _mock_yolo_like(out_channels: int = 256) -> nn.Module:
-    """[B,3,H,W] → [B, C, H/32, W/32] mock encoder (YOLO P5 mimari)."""
-    class MockYOLO(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layers = nn.Sequential(
-                nn.Conv2d(3, 32, 3, stride=2, padding=1),
-                nn.Conv2d(32, 64, 3, stride=2, padding=1),
-                nn.Conv2d(64, 128, 3, stride=2, padding=1),
-                nn.Conv2d(128, out_channels, 3, stride=2, padding=1),
-                nn.Conv2d(out_channels, out_channels, 3, stride=2, padding=1),
-            )
+def _mock_yolo_like(channels=(32, 64, 128)) -> nn.Module:
+    """23-layer Sequential mimicking YOLOv8 FPN — P3/P4/P5 at layers 15/18/21.
 
-        def forward(self, x):
-            return self.layers(x)
-
-    return MockYOLO()
+    test_moco_v3.py'deki mock paterniyle uyumlu — MultiScaleFeatureTap'in
+    "P5" hook'unu doğru katmana takabilmesi için.
+    """
+    p3, p4, p5 = channels
+    layers = []
+    layers.append(nn.Conv2d(3, p3, 3, stride=2, padding=1))    # 0 /2
+    for _ in range(5):
+        layers.append(nn.Conv2d(p3, p3, 3, padding=1))         # 1-5
+    layers.append(nn.Conv2d(p3, p3, 3, stride=2, padding=1))   # 6 /4
+    for _ in range(5):
+        layers.append(nn.Conv2d(p3, p3, 3, padding=1))         # 7-11
+    layers.append(nn.Conv2d(p3, p3, 3, stride=2, padding=1))   # 12 /8
+    layers.append(nn.Conv2d(p3, p3, 3, padding=1))             # 13
+    layers.append(nn.Conv2d(p3, p3, 3, padding=1))             # 14
+    layers.append(nn.Conv2d(p3, p3, 3, padding=1))             # 15 P3
+    layers.append(nn.Conv2d(p3, p4, 3, stride=2, padding=1))   # 16 /16
+    layers.append(nn.Conv2d(p4, p4, 3, padding=1))             # 17
+    layers.append(nn.Conv2d(p4, p4, 3, padding=1))             # 18 P4
+    layers.append(nn.Conv2d(p4, p5, 3, stride=2, padding=1))   # 19 /32
+    layers.append(nn.Conv2d(p5, p5, 3, padding=1))             # 20
+    layers.append(nn.Conv2d(p5, p5, 3, padding=1))             # 21 P5
+    return nn.Sequential(*layers)
 
 
 def _make_trainer(**kw):
     defaults = dict(
-        model=_mock_yolo_like(256), feat_dim=256,
+        model=_mock_yolo_like(), feat_dim=128,  # P5 = channels[2] = 128 in mock
         scales=(0.3, 0.6), patches_per_scale=4, patch_size=64,
         target_patch_size=64, alpha=1.0, momentum=0.99,
         similarity_threshold=0.5, T_hidden_dim=16,
@@ -58,8 +66,10 @@ class TestGASPTrainer:
         patches = torch.randn(8, 3, 64, 64)
         f_online = t._encode(patches, use_ema=False)
         f_ema = t._encode(patches, use_ema=True)
-        assert f_online.shape == (8, 256)
-        assert f_ema.shape == (8, 256)
+        # Mock encoder P5 = channels[2] = 128 (yeni mock _mock_yolo_like()).
+        # Önceki test 256 bekliyordu — eski (out_channels=256) mock için doğruydu.
+        assert f_online.shape == (8, 128)
+        assert f_ema.shape == (8, 128)
         assert not f_ema.requires_grad
         t.cleanup()
 

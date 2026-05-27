@@ -34,6 +34,7 @@ from .transform import ScaleEquivariantTransform
 from .patch_sampler import MultiScalePatchSampler
 from .natural_pair import NaturalPairMatcher
 from .losses import controlled_loss, natural_loss
+from ..dense.multi_scale_tap import MultiScaleFeatureTap
 
 
 class GASPTrainer:
@@ -59,6 +60,7 @@ class GASPTrainer:
         self,
         model,
         feat_dim: int = 256,
+        feat_level: str = "P5",
         scales: Tuple[float, ...] = (0.2, 0.5),
         patches_per_scale: int = 8,
         patch_size: int = 64,
@@ -80,6 +82,7 @@ class GASPTrainer:
         self.alpha = alpha
         self.momentum = momentum
         self.imgsz = imgsz
+        self.feat_level = feat_level
         self.patch_size = patch_size
         self.target_patch_size = target_patch_size
         self.scales = tuple(scales)
@@ -91,12 +94,25 @@ class GASPTrainer:
         else:
             self.model = model.to(device)
         self.model.train()
+        # Ultralytics YOLO().model varsayilan olarak requires_grad=False ile gelir
+        # (inference modu). Egitim icin parametreleri trainable yapmak ZORUNDAYIZ;
+        # aksi halde optimizer.step() no-op olur (30K kosusunda 5 saatlik bug bu).
+        for p in self.model.parameters():
+            p.requires_grad = True
 
         # EMA encoder — deepcopy, eval mode, requires_grad=False
         self.ema_model = copy.deepcopy(self.model).to(device)
         self.ema_model.eval()
         for p in self.ema_model.parameters():
             p.requires_grad = False
+
+        # Feature tap'lar — MoCo-v3 paterni: forward çıktısı yerine hook ile
+        # belirli FPN seviyesindeki feature'ı al. Ultralytics dict yapısına
+        # bağımlı değiliz; tap level adıyla erişir.
+        self.online_tap = MultiScaleFeatureTap(self.model, levels=(feat_level,))
+        self.online_tap.setup()
+        self.ema_tap = MultiScaleFeatureTap(self.ema_model, levels=(feat_level,))
+        self.ema_tap.setup()
 
         # GASP bileşenleri
         self.transform = ScaleEquivariantTransform(
@@ -119,32 +135,32 @@ class GASPTrainer:
         self.loss_history: list = []
 
     def _encode(self, patches: torch.Tensor, use_ema: bool = False) -> torch.Tensor:
-        """Yama batch'ini feature vektörlerine çevir.
+        """Yama batch'ini feature vektörlerine çevir (MoCo-v3 paterni).
+
+        Backbone forward çıktısı YOK SAYILIR (ultralytics dict döner: boxes/
+        scores/feats); FPN feature MultiScaleFeatureTap hook'larından alınır.
+        feat_level (default P5) ile seçilen seviye → adaptive_avg_pool2d →
+        [N, D] vektörü.
 
         Args:
             patches: [N, 3, P, P]
             use_ema: True ise EMA encoder, no_grad.
 
         Returns:
-            [N, D] feature vektörleri (P5'ten adaptive_avg_pool2d).
+            [N, D] feature vektörleri.
         """
-        encoder = self.ema_model if use_ema else self.model
         if use_ema:
+            self.ema_tap.clear()
             with torch.no_grad():
-                feats = encoder(patches)
+                _ = self.ema_model(patches)
+                feat = self.ema_tap.get_features()[self.feat_level]
+                pooled = F.adaptive_avg_pool2d(feat, 1).flatten(1)
+            return pooled.detach()
         else:
-            feats = encoder(patches)
-        # YOLO output [(P3, P4, P5), ...]; P5 al, GAP, flatten
-        if isinstance(feats, (list, tuple)):
-            # genellikle son eleman P5 (en derin)
-            p5 = feats[-1] if isinstance(feats[-1], torch.Tensor) else feats[0]
-        else:
-            p5 = feats
-        if p5.dim() == 4:
-            pooled = F.adaptive_avg_pool2d(p5, 1).flatten(1)
-        else:
-            pooled = p5
-        return pooled
+            self.online_tap.clear()
+            _ = self.model(patches)
+            feat = self.online_tap.get_features()[self.feat_level]
+            return F.adaptive_avg_pool2d(feat, 1).flatten(1)
 
     @torch.no_grad()
     def _ema_update(self) -> None:
@@ -304,6 +320,10 @@ class GASPTrainer:
 
     def cleanup(self) -> None:
         """Belleği temizle (MoCo-v3 paterni)."""
+        if hasattr(self, "online_tap"):
+            self.online_tap.close()
+        if hasattr(self, "ema_tap"):
+            self.ema_tap.close()
         if hasattr(self, "model"):
             del self.model
         if hasattr(self, "ema_model"):
