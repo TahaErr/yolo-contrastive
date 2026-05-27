@@ -1,0 +1,323 @@
+"""GASPTrainer — Geometry-Aware Scale Pretraining (GASP §2-§4 birleşimi).
+
+Bütün GASP bileşenlerini birleştiren ana sınıf:
+    - Online encoder (yolov8n veya başka)
+    - EMA encoder (matching için, MoCo-v3 paterni)
+    - ScaleEquivariantTransform (öğrenilen T)
+    - MultiScalePatchSampler (konumsuz, çoklu ölçekli yamalar)
+    - NaturalPairMatcher (Mod A, karşılıklı en-yakın-komşu)
+    - controlled_loss + natural_loss (eşzamanlı, α sabit)
+
+MoCo-v3 paterninden ödünç: __init__, _ema_update, train(epochs, resume,
+scheduler, save_every), _save, cleanup. GASP'a özel: _step iki kayıp
+hesaplar; sampler önce yamalar üretir, encoder + EMA encoder iki kez
+çağrılır, T tutarlılığı her iki kayıpta sınanır.
+
+Plan §3 Korku 3: α sabit (default 1.0). Adaptif α (GradNorm) ileride —
+smoke-test gradyan-norm ölçümünden sonra.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import os
+import time
+from typing import Callable, Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from .transform import ScaleEquivariantTransform
+from .patch_sampler import MultiScalePatchSampler
+from .natural_pair import NaturalPairMatcher
+from .losses import controlled_loss, natural_loss
+
+
+class GASPTrainer:
+    """GASP — geometry-aware scale pretraining (MoCo-v3 paterninde).
+
+    Args:
+        model: YOLO modeli ya da uyumlu mimari (P5 feature çıkarılır).
+            "yolov8n.pt" gibi string ya da hazır nn.Module.
+        feat_dim: encoder çıktı feature boyutu. Default 256 (yolov8n P5).
+        scales: yama ölçekleri (sampler için). Default (0.2, 0.5).
+        patches_per_scale: her görüntüden, her ölçek için kaç yama.
+        patch_size: encoder'a verilecek yama boyutu. Default 64.
+        target_patch_size: kontrollü kayıp augment hedefi. Default 64.
+        alpha: L_kontrollü ağırlığı (L_doğal sabit 1.0). Default 1.0.
+        momentum: EMA encoder momentum. Default 0.99.
+        similarity_threshold: NaturalPairMatcher τ. Default 0.7.
+        T_hidden_dim: ScaleEquivariantTransform hidden boyutu. Default 32.
+        imgsz: input görüntü boyutu (sampler için). Default 320.
+        device: "cuda" / "cpu".
+    """
+
+    def __init__(
+        self,
+        model,
+        feat_dim: int = 256,
+        scales: Tuple[float, ...] = (0.2, 0.5),
+        patches_per_scale: int = 8,
+        patch_size: int = 64,
+        target_patch_size: int = 64,
+        alpha: float = 1.0,
+        momentum: float = 0.99,
+        similarity_threshold: float = 0.7,
+        T_hidden_dim: int = 32,
+        imgsz: int = 320,
+        device: str = "cuda",
+    ):
+        if not (0.0 <= momentum < 1.0):
+            raise ValueError(f"momentum ∈ [0, 1), got {momentum}")
+        if alpha < 0:
+            raise ValueError(f"alpha >= 0, got {alpha}")
+
+        self.device = device
+        self.feat_dim = feat_dim
+        self.alpha = alpha
+        self.momentum = momentum
+        self.imgsz = imgsz
+        self.patch_size = patch_size
+        self.target_patch_size = target_patch_size
+        self.scales = tuple(scales)
+
+        # Encoder — yolov8 string ya da nn.Module
+        if isinstance(model, str):
+            from ultralytics import YOLO
+            self.model = YOLO(model).model.to(device)
+        else:
+            self.model = model.to(device)
+        self.model.train()
+
+        # EMA encoder — deepcopy, eval mode, requires_grad=False
+        self.ema_model = copy.deepcopy(self.model).to(device)
+        self.ema_model.eval()
+        for p in self.ema_model.parameters():
+            p.requires_grad = False
+
+        # GASP bileşenleri
+        self.transform = ScaleEquivariantTransform(
+            feat_dim=feat_dim, hidden_dim=T_hidden_dim,
+        ).to(device)
+        self.sampler = MultiScalePatchSampler(
+            scales=scales,
+            patches_per_scale=patches_per_scale,
+            patch_size=patch_size,
+        )
+        self.matcher = NaturalPairMatcher(
+            similarity_threshold=similarity_threshold,
+        )
+
+        # ScaleA, scaleB — controlled_loss için. Sampler scales'ından ilk iki
+        # (genelde küçük ve büyük). Tek scale verilirse self-self.
+        self._scale_a = self.scales[0]
+        self._scale_b = self.scales[-1] if len(self.scales) > 1 else self.scales[0]
+
+        self.loss_history: list = []
+
+    def _encode(self, patches: torch.Tensor, use_ema: bool = False) -> torch.Tensor:
+        """Yama batch'ini feature vektörlerine çevir.
+
+        Args:
+            patches: [N, 3, P, P]
+            use_ema: True ise EMA encoder, no_grad.
+
+        Returns:
+            [N, D] feature vektörleri (P5'ten adaptive_avg_pool2d).
+        """
+        encoder = self.ema_model if use_ema else self.model
+        if use_ema:
+            with torch.no_grad():
+                feats = encoder(patches)
+        else:
+            feats = encoder(patches)
+        # YOLO output [(P3, P4, P5), ...]; P5 al, GAP, flatten
+        if isinstance(feats, (list, tuple)):
+            # genellikle son eleman P5 (en derin)
+            p5 = feats[-1] if isinstance(feats[-1], torch.Tensor) else feats[0]
+        else:
+            p5 = feats
+        if p5.dim() == 4:
+            pooled = F.adaptive_avg_pool2d(p5, 1).flatten(1)
+        else:
+            pooled = p5
+        return pooled
+
+    @torch.no_grad()
+    def _ema_update(self) -> None:
+        """EMA encoder güncellemesi (MoCo-v3 paterni)."""
+        for p, p_ema in zip(self.model.parameters(), self.ema_model.parameters()):
+            p_ema.data.mul_(self.momentum).add_(p.data, alpha=1 - self.momentum)
+
+    def _step(self, imgs: torch.Tensor) -> Dict:
+        """Tek batch — iki kayıp hesapla."""
+        imgs = imgs.to(self.device)
+
+        # Sampler — yamalar, log_scales, image_ids
+        patches, log_scales, image_ids = self.sampler(imgs)
+        patches = patches.to(self.device)
+        log_scales = log_scales.to(self.device)
+        image_ids = image_ids.to(self.device)
+
+        # L_kontrollü — encoder fonksiyonu olarak self._encode kullan
+        # patches doğrudan controlled_loss'a giriyor; o iki kez augment edip
+        # encoder'ı iki kez çağırıyor
+        ctrl_out = controlled_loss(
+            patches=patches,
+            encoder=lambda x: self._encode(x, use_ema=False),
+            transform=self.transform,
+            scale_a=self._scale_a,
+            scale_b=self._scale_b,
+            target_patch_size=self.target_patch_size,
+        )
+
+        # L_doğal — online + EMA features hesapla, eşleştir, T tutarlılığı
+        # Hem online hem EMA aynı yamalar üzerinde çalışır
+        online_feats = self._encode(patches, use_ema=False)
+        ema_feats = self._encode(patches, use_ema=True)
+        nat_out = natural_loss(
+            online_features=online_feats,
+            ema_features=ema_feats,
+            log_scales=log_scales,
+            image_ids=image_ids,
+            matcher=self.matcher,
+            transform=self.transform,
+        )
+
+        total = self.alpha * ctrl_out["loss"] + nat_out["loss"]
+        return {
+            "loss": total,
+            "L_ctrl": float(ctrl_out["loss"].detach()),
+            "L_nat": float(nat_out["loss"].detach()) if nat_out["n_pairs"] > 0 else 0.0,
+            "n_pairs": nat_out["n_pairs"],
+        }
+
+    def train(
+        self,
+        images_dir: str,
+        epochs: int = 50,
+        batch_size: int = 32,
+        lr: float = 3e-4,
+        weight_decay: float = 0.05,
+        warmup_epochs: int = 5,
+        num_workers: int = 4,
+        output: str = "/content/gasp_yolov8n.pt",
+        save_every: int = 5,
+        print_every: int = 1,
+        resume_from: Optional[str] = None,
+        gradient_clip: Optional[float] = 1.0,
+    ) -> str:
+        """Pretraining ana döngü (MoCo-v3 paterninde)."""
+        from ..pretrain.dataset import UnlabeledImageDataset
+        ds = UnlabeledImageDataset(images_dir, imgsz=self.imgsz)
+        dl = DataLoader(
+            ds, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, drop_last=True, pin_memory=True,
+        )
+
+        params = (
+            list(self.model.parameters())
+            + list(self.transform.parameters())
+        )
+        optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
+        steps_per_epoch = len(dl)
+        total_steps = steps_per_epoch * epochs
+        warmup_steps = steps_per_epoch * warmup_epochs
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            import math
+            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        start_epoch = 1
+        if resume_from is not None and os.path.exists(resume_from):
+            ckpt = torch.load(resume_from, map_location=self.device, weights_only=False)
+            self.model.load_state_dict(ckpt["model"])
+            self.ema_model.load_state_dict(ckpt["ema_model"])
+            self.transform.load_state_dict(ckpt["transform"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            start_epoch = ckpt["epoch"] + 1
+            self.loss_history = ckpt.get("loss_history", [])
+            print(f"  ↳ resume edildi: ep{start_epoch-1}")
+
+        for epoch in range(start_epoch, epochs + 1):
+            t0 = time.time()
+            ep_loss = 0.0; ep_ctrl = 0.0; ep_nat = 0.0; ep_pairs = 0; nb = 0
+            for imgs in dl:
+                optimizer.zero_grad(set_to_none=True)
+                out = self._step(imgs)
+                out["loss"].backward()
+                if gradient_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(params, gradient_clip)
+                optimizer.step()
+                scheduler.step()
+                self._ema_update()
+                ep_loss += float(out["loss"].detach())
+                ep_ctrl += out["L_ctrl"]
+                ep_nat += out["L_nat"]
+                ep_pairs += out["n_pairs"]
+                nb += 1
+            avg_loss = ep_loss / nb
+            avg_ctrl = ep_ctrl / nb
+            avg_nat = ep_nat / nb
+            avg_pairs = ep_pairs / nb
+            self.loss_history.append({
+                "epoch": epoch, "loss": avg_loss,
+                "L_ctrl": avg_ctrl, "L_nat": avg_nat,
+                "n_pairs_avg": avg_pairs,
+                "T_identity_dist": float(self.transform.identity_distance(
+                    torch.tensor([[0.5]], device=self.device)
+                ).item()),
+            })
+            if epoch % print_every == 0:
+                print(f"[gasp] epoch {epoch}/{epochs} loss={avg_loss:.4f} "
+                      f"L_ctrl={avg_ctrl:.4f} L_nat={avg_nat:.4f} "
+                      f"pairs/batch={avg_pairs:.1f} ({time.time()-t0:.1f}s)")
+            if epoch % save_every == 0 or epoch == epochs:
+                self._save(output, epoch, optimizer, scheduler)
+
+        return output
+
+    def _save(self, output: str, epoch: int, optimizer, scheduler) -> None:
+        os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+        torch.save({
+            "model": self.model.state_dict(),
+            "ema_model": self.ema_model.state_dict(),
+            "transform": self.transform.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch,
+            "loss_history": self.loss_history,
+        }, output.replace(".pt", ".resume.pt"))
+        torch.save({"model": self.model.state_dict()},
+                   output.replace(".pt", f"_ep{epoch}.pt"))
+        with open(output.replace(".pt", "_loss_history.json"), "w") as f:
+            json.dump({"loss_history": self.loss_history}, f, indent=2)
+
+    def cleanup(self) -> None:
+        """Belleği temizle (MoCo-v3 paterni)."""
+        if hasattr(self, "model"):
+            del self.model
+        if hasattr(self, "ema_model"):
+            del self.ema_model
+        if hasattr(self, "transform"):
+            del self.transform
+        torch.cuda.empty_cache()
+
+    def __del__(self):
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+    def __repr__(self) -> str:
+        return (f"GASPTrainer(feat_dim={self.feat_dim}, scales={self.scales}, "
+                f"α={self.alpha}, momentum={self.momentum})")
