@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 from .transform import ScaleEquivariantTransform
 from .patch_sampler import MultiScalePatchSampler
 from .natural_pair import NaturalPairMatcher
-from .losses import controlled_loss, natural_loss
+from .losses import controlled_loss, natural_loss, feature_regularization_loss
 from ..dense.multi_scale_tap import MultiScaleFeatureTap
 
 
@@ -66,6 +66,9 @@ class GASPTrainer:
         patch_size: int = 64,
         target_patch_size: int = 64,
         alpha: float = 1.0,
+        lambda_var: float = 25.0,
+        lambda_cov: float = 1.0,
+        variance_target: float = 1.0,
         momentum: float = 0.99,
         similarity_threshold: float = 0.7,
         T_hidden_dim: int = 32,
@@ -80,6 +83,9 @@ class GASPTrainer:
         self.device = device
         self.feat_dim = feat_dim
         self.alpha = alpha
+        self.lambda_var = lambda_var
+        self.lambda_cov = lambda_cov
+        self.variance_target = variance_target
         self.momentum = momentum
         self.imgsz = imgsz
         self.feat_level = feat_level
@@ -203,11 +209,28 @@ class GASPTrainer:
             transform=self.transform,
         )
 
-        total = self.alpha * ctrl_out["loss"] + nat_out["loss"]
+        # VICReg-style feature düzenleyici — kollaps engeli.
+        # GASP'ın "bilgi koruma" şartı; T tabanlı tutarlılıkla birlikte
+        # eşdeğişirliğin varlık şartını oluşturur.
+        reg_out = feature_regularization_loss(
+            online_feats,
+            variance_target=self.variance_target,
+        )
+        L_var = reg_out["variance"]
+        L_cov = reg_out["covariance"]
+
+        total = (
+            self.alpha * ctrl_out["loss"]
+            + nat_out["loss"]
+            + self.lambda_var * L_var
+            + self.lambda_cov * L_cov
+        )
         return {
             "loss": total,
             "L_ctrl": float(ctrl_out["loss"].detach()),
             "L_nat": float(nat_out["loss"].detach()) if nat_out["n_pairs"] > 0 else 0.0,
+            "L_var": float(L_var.detach()),
+            "L_cov": float(L_cov.detach()),
             "n_pairs": nat_out["n_pairs"],
         }
 
@@ -266,7 +289,8 @@ class GASPTrainer:
 
         for epoch in range(start_epoch, epochs + 1):
             t0 = time.time()
-            ep_loss = 0.0; ep_ctrl = 0.0; ep_nat = 0.0; ep_pairs = 0; nb = 0
+            ep_loss = 0.0; ep_ctrl = 0.0; ep_nat = 0.0
+            ep_var = 0.0; ep_cov = 0.0; ep_pairs = 0; nb = 0
             for imgs in dl:
                 optimizer.zero_grad(set_to_none=True)
                 out = self._step(imgs)
@@ -279,15 +303,20 @@ class GASPTrainer:
                 ep_loss += float(out["loss"].detach())
                 ep_ctrl += out["L_ctrl"]
                 ep_nat += out["L_nat"]
+                ep_var += out["L_var"]
+                ep_cov += out["L_cov"]
                 ep_pairs += out["n_pairs"]
                 nb += 1
             avg_loss = ep_loss / nb
             avg_ctrl = ep_ctrl / nb
             avg_nat = ep_nat / nb
+            avg_var = ep_var / nb
+            avg_cov = ep_cov / nb
             avg_pairs = ep_pairs / nb
             self.loss_history.append({
                 "epoch": epoch, "loss": avg_loss,
                 "L_ctrl": avg_ctrl, "L_nat": avg_nat,
+                "L_var": avg_var, "L_cov": avg_cov,
                 "n_pairs_avg": avg_pairs,
                 "T_identity_dist": float(self.transform.identity_distance(
                     torch.tensor([[0.5]], device=self.device)
@@ -296,6 +325,7 @@ class GASPTrainer:
             if epoch % print_every == 0:
                 print(f"[gasp] epoch {epoch}/{epochs} loss={avg_loss:.4f} "
                       f"L_ctrl={avg_ctrl:.4f} L_nat={avg_nat:.4f} "
+                      f"L_var={avg_var:.4f} L_cov={avg_cov:.4f} "
                       f"pairs/batch={avg_pairs:.1f} ({time.time()-t0:.1f}s)")
             if epoch % save_every == 0 or epoch == epochs:
                 self._save(output, epoch, optimizer, scheduler)

@@ -218,3 +218,59 @@ def natural_loss(
         "n_pairs": int(idx_a.numel()),
         "mse": float(loss.detach()),
     }
+
+
+
+def feature_regularization_loss(
+    features: torch.Tensor,
+    variance_target: float = 1.0,
+    eps: float = 1e-4,
+) -> dict:
+    """VICReg-style feature düzenleyici — kollaps engeli (GASP'ın bilgi-koruma şartı).
+
+    GASP'ın iki kaybı (controlled, natural) T tabanlı tutarlılık öğretir,
+    ama bilgi koruma şartı yoktu — kollaps doğrulandı (ep2'de varyans
+    2.3e-5, cosine 0.9996). Bu kayıp eşdeğişirliğin VARLIK ŞARTI olarak
+    eklenir: feature uzayı bilgi taşımıyorsa, eşdeğişirlik trivially
+    sağlanır (her şey ~sabit vektör).
+
+    İki terim (Bardes et al. 2022, VICReg):
+        - Variance: her boyutun std'si γ eşiğinin altına düşmesin
+            V(Z) = (1/D) Σ_d max(0, γ − √(Var(z_d) + ε))
+        - Covariance: off-diagonal kovaryanslar küçük olsun
+            C(Z) = (1/D) Σ_{i≠j} [Cov(Z)]_{i,j}²
+
+    Args:
+        features: [N, D] feature vektörleri (online encoder çıktısı).
+        variance_target: γ — std için minimum hedef (default 1.0, VICReg
+            varsayılanı).
+        eps: numerik stabilite.
+
+    Returns:
+        {"variance": skaler, "covariance": skaler}
+    """
+    if features.dim() != 2:
+        raise ValueError(f"features [N, D] olmalı, alındı: {tuple(features.shape)}")
+    if features.shape[0] < 2:
+        # tek örnek var — varyans tanımsız, sıfır kayıp
+        zero = torch.zeros((), device=features.device, dtype=features.dtype)
+        return {"variance": zero, "covariance": zero}
+
+    N, D = features.shape
+
+    # Center: variance ve covariance için ortalamayı çıkar
+    centered = features - features.mean(dim=0, keepdim=True)   # [N, D]
+
+    # ── Variance loss ──
+    # Std per boyut; γ eşiğinin altındaysa cezalandır (hinge)
+    std = torch.sqrt(centered.var(dim=0) + eps)                # [D]
+    variance_loss = F.relu(variance_target - std).mean()
+
+    # ── Covariance loss ──
+    # Cov(Z) = (1/(N-1)) Z^T Z (centered için)
+    cov = (centered.T @ centered) / (N - 1)                    # [D, D]
+    # Off-diagonal: maske + kare ortalama
+    off_diag_mask = ~torch.eye(D, dtype=torch.bool, device=features.device)
+    covariance_loss = (cov[off_diag_mask] ** 2).sum() / D
+
+    return {"variance": variance_loss, "covariance": covariance_loss}

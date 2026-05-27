@@ -78,7 +78,9 @@ class TestGASPTrainer:
         out = t._step(torch.randn(2, 3, 128, 128))
         assert out["loss"].dim() == 0
         assert out["loss"].requires_grad
-        assert "L_ctrl" in out and "L_nat" in out and "n_pairs" in out
+        # VICReg eklendi: L_var, L_cov da geri döner
+        for key in ["L_ctrl", "L_nat", "L_var", "L_cov", "n_pairs"]:
+            assert key in out, f"_step output eksik anahtar: {key}"
         t.cleanup()
 
     def test_gradient_flow(self):
