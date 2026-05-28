@@ -76,6 +76,7 @@ class GASPTrainer:
         T_hidden_dim: int = 32,
         imgsz: int = 320,
         device: str = "cuda",
+        ctrl_detach_encoder: bool = False,
     ):
         if not (0.0 <= momentum < 1.0):
             raise ValueError(f"momentum ∈ [0, 1), got {momentum}")
@@ -98,7 +99,7 @@ class GASPTrainer:
         self.patch_size = patch_size
         self.target_patch_size = target_patch_size
         self.scales = tuple(scales)
-
+        self.ctrl_detach_encoder = ctrl_detach_encoder
         # Encoder — yolov8 string ya da nn.Module
         if isinstance(model, str):
             from ultralytics import YOLO
@@ -127,7 +128,15 @@ class GASPTrainer:
         self.ema_tap.setup()
 
         # GASP bileşenleri
+        # T_nat: natural loss (eşleşmiş farklı içerik, ölçekler arası).
         self.transform = ScaleEquivariantTransform(
+            feat_dim=feat_dim, hidden_dim=T_hidden_dim,
+        ).to(device)
+        # T_ctrl: controlled loss (aynı içerik, saf yeniden-ölçekleme) — AYRI head
+        # (§10.41). Tek T paylaşımında L_nat, T'yi L_ctrl optimumundan sürüklüyordu:
+        # paylaşılan T chance'te sıkışırken bağımsız T_ctrl ~%20 chance altına iner.
+        # Encoder ortak kalır → eşdeğişirlik encoder düzeyinde; downstream T kullanmaz.
+        self.transform_ctrl = ScaleEquivariantTransform(
             feat_dim=feat_dim, hidden_dim=T_hidden_dim,
         ).to(device)
         self.sampler = MultiScalePatchSampler(
@@ -218,12 +227,13 @@ class GASPTrainer:
             ctrl_out = controlled_loss_F(
                 patches=patches,
                 encoder=lambda x: self._encode(x, use_ema=False),
-                transform=self.transform,
+                transform=self.transform_ctrl,
                 scale_a=scale_a,
                 scale_b=scale_b,
                 target_patch_size=self.target_patch_size,
                 candidate_log_ratios=candidate_log_ratios_ctrl,
                 temperature=self.temperature,
+                detach_encoder=self.ctrl_detach_encoder,
             )
         else:
             ctrl_out = controlled_loss(
@@ -319,6 +329,7 @@ class GASPTrainer:
         params = (
             list(self.model.parameters())
             + list(self.transform.parameters())
+            + list(self.transform_ctrl.parameters())
         )
         optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
@@ -340,6 +351,8 @@ class GASPTrainer:
             self.model.load_state_dict(ckpt["model"])
             self.ema_model.load_state_dict(ckpt["ema_model"])
             self.transform.load_state_dict(ckpt["transform"])
+            if "transform_ctrl" in ckpt:        # eski ckpt'lerde yok (geriye-uyum)
+                self.transform_ctrl.load_state_dict(ckpt["transform_ctrl"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
             start_epoch = ckpt["epoch"] + 1
@@ -397,6 +410,7 @@ class GASPTrainer:
             "model": self.model.state_dict(),
             "ema_model": self.ema_model.state_dict(),
             "transform": self.transform.state_dict(),
+            "transform_ctrl": self.transform_ctrl.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,

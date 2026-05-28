@@ -74,6 +74,51 @@ def _augment_patch(
     )
 
 
+def _augment_patch_scale_aware(
+    patches: torch.Tensor,
+    target_size: int,
+    view_scale: float,
+    brightness: float = 0.2,
+    contrast: float = 0.2,
+    blur_sigma: float = 0.5,
+) -> torch.Tensor:
+    """Scale-aware augmentation (GASP §10.38 — L_ctrl fix).
+
+    Yamayı önce `view_scale` oranına küçültür, sonra `target_size`'a geri
+    büyütür. Düşük view_scale'de kaybolan detay GERİ GELMEZ — encoder iki
+    view arasında GERÇEK ölçek farkını görür (eski `_augment_patch` ile her
+    iki view aynı boyuta gidiyordu, ölçek sinyali sıfırdı: L_ctrl donuk bug).
+
+    view_scale ∈ (0, 1] beklenir (örn. 0.2 → yama %20 boyutunda görünür,
+    bulanık; 0.5 → %50, daha keskin). Mutlak ölçek semantiği: her view kendi
+    ölçeğince bozulur, fark = log(scale_b/scale_a) ile tutarlı sinyal.
+
+    Args:
+        patches: [N, 3, P, P]
+        target_size: encoder'a verilecek çıktı boyutu
+        view_scale: görünür ölçek faktörü (0, 1]
+        brightness, contrast, blur_sigma: _augment_patch ile aynı jitter
+
+    Returns:
+        [N, 3, target_size, target_size]
+    """
+    # Görünür-ölçek sinyali enjekte et: küçült → geri büyüt (detay kaybı kalıcı)
+    intermediate = max(int(round(target_size * view_scale)), 4)
+    small = F.interpolate(
+        patches, size=(intermediate, intermediate),
+        mode="bilinear", align_corners=False,
+    )
+    upscaled = F.interpolate(
+        small, size=(target_size, target_size),
+        mode="bilinear", align_corners=False,
+    )
+    # jitter + blur'ı _augment_patch'ten reuse et (son resize target→target no-op).
+    return _augment_patch(
+        upscaled, target_size,
+        brightness=brightness, contrast=contrast, blur_sigma=blur_sigma,
+    )
+
+
 def controlled_loss(
     patches: torch.Tensor,
     encoder: Callable[[torch.Tensor], torch.Tensor],
@@ -285,8 +330,11 @@ def controlled_loss_F(
     scale_b: float,
     target_patch_size: int,
     candidate_log_ratios: torch.Tensor = None,
-    temperature: float = 0.2,
+    temperature: float = 0.07,
     augment: bool = True,
+    scale_aware_aug: bool = True,
+    similarity: str = "cosine",
+    detach_encoder: bool = False,
 ) -> dict:
     """L_kontrollü_F — sahte-dönüşüm-aware controlled loss (GASP §10.37).
 
@@ -308,8 +356,20 @@ def controlled_loss_F(
         target_patch_size: encoder'a verilecek boyut.
         candidate_log_ratios: [K] sahte log_r adayları. None ise YALNIZ
             gerçek log_r kullanılır (L2 fallback, ablation için).
-        temperature: InfoNCE sıcaklığı (default 0.2, SimCLR aralığında).
+        temperature: InfoNCE sıcaklığı (default 0.07; cosine için kalibre,
+            MoCo aralığında — §10.39 oracle sweep).
         augment: True ise renk-jitter + blur (kontrollü-hile savunması).
+        scale_aware_aug: True (default) ise iki view scale_a/scale_b ile
+            fiilen farklı görünür ölçeğe getirilir (L_ctrl fix, §10.38).
+            False → eski davranış (her iki view aynı boyut; ablation/uyumluluk).
+        similarity: "cosine" (default) → L2-normalize edilmiş cosine InfoNCE
+            (kalibre, kontrast üretir). "mse" → eski ham kare-L2 (ablation;
+            §10.39: oracle T'yle bile chance'in ~%2 altında — kullanma).
+        detach_encoder: True ise f_a/f_b encoder grafiğinden koparılır →
+            L_ctrl yalnız T'yi eğitir, encoder'a gradyan akmaz (§10.40).
+            Gerekçe: L_ctrl sentetik augmentasyon; encoder'ı doğal L_nat
+            şekillendirmeli. İzolasyon testi: encoder donukken T kusursuz
+            öğreniyor; joint'te L_ctrl gradyanı encoder'ı bozuyordu.
 
     Returns:
         {"loss": skaler, "mse_real": float, "log_ratio_real": float,
@@ -328,8 +388,14 @@ def controlled_loss_F(
 
     # İki augment
     if augment:
-        view_a = _augment_patch(patches, target_patch_size)
-        view_b = _augment_patch(patches, target_patch_size)
+        if scale_aware_aug:
+            # Scale-aware: iki view fiilen farklı görünür ölçek görür (§10.38 fix)
+            view_a = _augment_patch_scale_aware(patches, target_patch_size, scale_a)
+            view_b = _augment_patch_scale_aware(patches, target_patch_size, scale_b)
+        else:
+            # Eski davranış (ablation/uyumluluk): ölçek sinyali yok
+            view_a = _augment_patch(patches, target_patch_size)
+            view_b = _augment_patch(patches, target_patch_size)
     else:
         view_a = F.interpolate(patches, size=(target_patch_size, target_patch_size),
                                 mode="bilinear", align_corners=False)
@@ -337,6 +403,11 @@ def controlled_loss_F(
 
     f_a = encoder(view_a)   # [N, D]
     f_b = encoder(view_b)   # [N, D]
+
+    if detach_encoder:
+        # L_ctrl yalnız T'yi eğitsin; encoder'a gradyan akmasın (§10.40).
+        f_a = f_a.detach()
+        f_b = f_b.detach()
 
     # Gerçek log_r
     log_ratio_real = math.log(scale_b / scale_a)
@@ -356,30 +427,37 @@ def controlled_loss_F(
 
     # Aday set: real önce, sonra sahteler. İlk indeks = real.
     candidates = candidate_log_ratios.to(device=device, dtype=f_a.dtype)   # [K_other]
+    # Duplike-temizleme (§10.39 bugfix): gerçek log_r sahte adaylar arasında
+    # da varsa çıkar — yoksa pozitif aynı anda negatif olur, oracle T bile
+    # p_real ≤ 0.5'e sıkışır.
+    candidates = candidates[(candidates - log_ratio_real).abs() > 1e-6]
     real_t = torch.tensor([log_ratio_real], device=device, dtype=f_a.dtype)
     all_log_r = torch.cat([real_t, candidates], dim=0)   # [K_total], real ilk
     K = all_log_r.shape[0]
 
-    # Her aday için d_k = ||T(f_a, log_r_k) - f_b||² (örnek bazlı ortalama)
-    # Vectorize: T'yi K kez çağır, yığınla
-    # f_a [N, D], log_r [N, 1] aldığı için, K aday için K kez çağırırız.
-    # Daha verimli: tile f_a → [N*K, D], log_r broadcast → [N*K, 1]
+    # T'yi K aday için vektörize uygula: tile f_a → [K*N, D]
     f_a_tiled = f_a.unsqueeze(0).expand(K, N, -1).reshape(K * N, -1)   # [K*N, D]
     log_r_tiled = all_log_r.unsqueeze(1).expand(K, N).reshape(K * N, 1)
     f_a_T = transform(f_a_tiled, log_r_tiled)   # [K*N, D]
     f_a_T = f_a_T.reshape(K, N, -1)              # [K, N, D]
-    # Her aday için MSE (per-sample, sonra batch ortalama):
     f_b_exp = f_b.unsqueeze(0).expand(K, N, -1)   # [K, N, D]
-    d_k = ((f_a_T - f_b_exp) ** 2).mean(dim=-1)   # [K, N] — per-sample distance
 
-    # InfoNCE: gerçek (k=0) en küçük d olmalı
-    # logits = -d_k / temperature, softmax → "doğru log_r seçilsin"
-    logits = -d_k / temperature           # [K, N]
-    # Cross-entropy: target = 0 (real first)
-    log_probs = F.log_softmax(logits, dim=0)   # softmax over candidates per sample
-    loss = -log_probs[0].mean()           # L = -log p(real) ortalama
+    # InfoNCE logit'leri — gerçek (k=0) en yüksek skoru almalı.
+    # (§10.39: ham MSE/τ kontrast üretmiyordu; cosine kalibre.)
+    if similarity == "cosine":
+        sim = F.cosine_similarity(f_a_T, f_b_exp, dim=-1)   # [K, N], yüksek=iyi
+        logits = sim / temperature
+    elif similarity == "mse":
+        d_k = ((f_a_T - f_b_exp) ** 2).mean(dim=-1)         # [K, N], düşük=iyi
+        logits = -d_k / temperature
+    else:
+        raise ValueError(f"similarity 'cosine' ya da 'mse' olmalı, alındı: {similarity!r}")
 
-    mse_real = float(d_k[0].mean().detach())
+    log_probs = F.log_softmax(logits, dim=0)   # adaylar üzerinde softmax (per-sample)
+    loss = -log_probs[0].mean()                # L = -log p(real) ortalama
+
+    # mse_real: similarity'den bağımsız teşhis metriği (her zaman ham MSE)
+    mse_real = float(((f_a_T[0] - f_b) ** 2).mean().detach())
 
     return {
         "loss": loss,
