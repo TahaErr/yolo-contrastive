@@ -112,3 +112,30 @@ class ScaleEquivariantTransform(nn.Module):
             params = self.gen(log_ratio)
             gamma, beta = params.chunk(2, dim=1)
             return (gamma.pow(2).mean() + beta.pow(2).mean())
+
+
+class ProjectionHead(nn.Module):
+    """SSL projektörü (v7) — backbone feature'ını kayıp uzayına eşler.
+
+    Kanıtlanmış collapse kök nedeni: eşdeğişirlik kayıpları doğrudan
+    backbone feature'ına uygulandığında düşük-rank'ı ödüllendiriyor ve
+    batch-regularizer'lar (var/cov/iso) bunu durduramıyor. Standart SSL
+    çözümü (SimCLR/VICReg/BYOL): kayıpları bir projektör çıktısına uygula,
+    backbone'u projektörden ÖNCE oku. Projektör collapse baskısını soğurur,
+    backbone temsili zengin (yüksek eff_rank) kalır. Pretrain sonrası
+    projektör atılır; downstream yalnız backbone'u kullanır.
+
+    Mimari: Linear → BN → ReLU → Linear (VICReg expander tarzı).
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int = 512, out_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)

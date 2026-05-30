@@ -15,12 +15,13 @@ from yolo_contrastive.gasp import feature_regularization_loss
 
 
 class TestFeatureRegularizationLoss:
-    def test_returns_dict_with_two_terms(self):
+    def test_returns_dict_with_three_terms(self):
         features = torch.randn(32, 64)
         out = feature_regularization_loss(features)
-        assert set(out.keys()) == {"variance", "covariance"}
+        assert set(out.keys()) == {"variance", "covariance", "isotropy"}
         assert out["variance"].dim() == 0
         assert out["covariance"].dim() == 0
+        assert out["isotropy"].dim() == 0
 
     def test_collapsed_features_high_variance_loss(self):
         """Tüm görüntüler aynı feature → std=0 → variance loss = γ."""
@@ -70,3 +71,33 @@ class TestFeatureRegularizationLoss:
         out = feature_regularization_loss(torch.randn(1, 64))
         assert out["variance"].item() == 0.0
         assert out["covariance"].item() == 0.0
+        assert out["isotropy"].item() == 0.0
+
+    def test_isotropy_distinguishes_rank_collapse(self):
+        """Isotropy terimi, kovaryansın KÖR olduğu varyans-eşitsizliği
+        collapse'ını yakalamalı: varyans birkaç boyuta yığılı (düşük
+        eff_rank) ama boyutlar dik → cov≈eşit ama isotropy ÇOK yüksek."""
+        torch.manual_seed(0)
+        N, D = 256, 256
+        # sağlıklı: eşit-varyanslı, korelasyonsuz
+        healthy = torch.randn(N, D)
+        # çökmüş: varyans 10 boyuta yığılı, geri kalan ~0, ama dik
+        collapsed = torch.zeros(N, D)
+        collapsed[:, :10] = torch.randn(N, 10) * 3.0
+        collapsed[:, 10:] = torch.randn(N, D - 10) * 0.02
+        # AYNI norm'a ölçekle — kovaryans-körlüğü ancak eşit norm'da net
+        healthy = healthy * (3.63 / healthy.norm(dim=1).mean())
+        collapsed = collapsed * (3.63 / collapsed.norm(dim=1).mean())
+        h = feature_regularization_loss(healthy)
+        c = feature_regularization_loss(collapsed)
+        # kovaryans ikisini ayırt EDEMEZ (kanıtlanmış körlük, eşit norm'da)
+        assert abs(h["covariance"].item() - c["covariance"].item()) < 0.01
+        # isotropy çökmüşe çok daha yüksek loss atmalı (ayırt eder)
+        assert c["isotropy"].item() > 10.0 * (h["isotropy"].item() + 1e-6)
+
+    def test_isotropy_gradient_flows(self):
+        features = torch.randn(64, 32, requires_grad=True)
+        out = feature_regularization_loss(features)
+        out["isotropy"].backward()
+        assert features.grad is not None
+        assert features.grad.abs().sum().item() > 0

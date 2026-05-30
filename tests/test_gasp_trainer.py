@@ -145,3 +145,54 @@ class TestGASPTrainer:
             assert len(t.loss_history) == 2
             assert "T_identity_dist" in t.loss_history[0]
             t.cleanup()
+
+
+class TestGASPProjectorV7:
+    """v7: projeksiyon başlığı — kayıplar z'de, backbone f projektörden önce."""
+
+    def test_projection_head_shape(self):
+        from yolo_contrastive.gasp.transform import ProjectionHead
+        proj = ProjectionHead(in_dim=128, hidden_dim=64, out_dim=96)
+        out = proj(torch.randn(8, 128))
+        assert out.shape == (8, 96)
+
+    def test_default_no_projector_is_v6(self):
+        """use_projector=False (default) → projektör yok, T backbone dim'inde."""
+        t = _make_trainer()
+        assert t.use_projector is False
+        assert t.projector is None
+        # _project kimlik olmalı
+        f = torch.randn(4, 128)
+        assert torch.equal(t._project(f), f)
+
+    def test_projector_construction_and_dims(self):
+        t = _make_trainer(use_projector=True, proj_hidden_dim=64, proj_dim=96)
+        assert t.use_projector is True
+        assert t.projector is not None
+        # backbone f hâlâ feat_dim (128); projeksiyon z proj_dim (96)
+        patches = torch.randn(8, 3, 64, 64)
+        f = t._encode(patches, use_ema=False)
+        assert f.shape[1] == 128, "backbone feat_dim değişmemeli (downstream/eff_rank)"
+        z = t._project(f)
+        assert z.shape[1] == 96, "projeksiyon proj_dim'e eşlemeli"
+
+    def test_step_runs_with_projector(self):
+        t = _make_trainer(use_projector=True, proj_hidden_dim=64, proj_dim=96,
+                          lambda_var=1.0, lambda_cov=1.0, lambda_iso=0.5)
+        out = t._step(torch.randn(2, 3, 128, 128))
+        for key in ("loss", "L_ctrl", "L_nat", "L_var", "L_cov", "L_iso"):
+            assert key in out
+        assert torch.isfinite(out["loss"]), "v7 step kaybı sonlu olmalı"
+        assert out["loss"].requires_grad, "gradient akışı (projektör + backbone)"
+
+    def test_projector_grads_flow_to_backbone(self):
+        """z üzerindeki kayıp backbone'a gradient akıtmalı (decouple ≠ kopuk)."""
+        t = _make_trainer(use_projector=True, proj_hidden_dim=64, proj_dim=96)
+        out = t._step(torch.randn(2, 3, 128, 128))
+        out["loss"].backward()
+        bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                      for p in t.model.parameters())
+        pj_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                      for p in t.projector.parameters())
+        assert bb_grad, "backbone gradient almalı (z=proj(f), f backbone'dan)"
+        assert pj_grad, "projektör gradient almalı"

@@ -30,7 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .transform import ScaleEquivariantTransform
+from .transform import ScaleEquivariantTransform, ProjectionHead
 from .patch_sampler import MultiScalePatchSampler
 from .natural_pair import NaturalPairMatcher
 from .losses import controlled_loss, natural_loss, feature_regularization_loss, controlled_loss_F, natural_loss_F
@@ -70,6 +70,7 @@ class GASPTrainer:
         temperature: float = 0.2,
         lambda_var: float = 0.0,
         lambda_cov: float = 0.0,
+        lambda_iso: float = 0.0,
         variance_target: float = 1.0,
         momentum: float = 0.99,
         similarity_threshold: float = 0.7,
@@ -77,6 +78,9 @@ class GASPTrainer:
         imgsz: int = 320,
         device: str = "cuda",
         ctrl_detach_encoder: bool = False,
+        use_projector: bool = False,
+        proj_hidden_dim: int = 512,
+        proj_dim: int = 256,
     ):
         if not (0.0 <= momentum < 1.0):
             raise ValueError(f"momentum ∈ [0, 1), got {momentum}")
@@ -92,6 +96,7 @@ class GASPTrainer:
         self.temperature = temperature
         self.lambda_var = lambda_var
         self.lambda_cov = lambda_cov
+        self.lambda_iso = lambda_iso
         self.variance_target = variance_target
         self.momentum = momentum
         self.imgsz = imgsz
@@ -127,17 +132,29 @@ class GASPTrainer:
         self.ema_tap = MultiScaleFeatureTap(self.ema_model, levels=(feat_level,))
         self.ema_tap.setup()
 
+        # v7: projeksiyon başlığı. use_projector=True ise kayıplar projektör
+        # çıktısında (z) hesaplanır, T'ler z-boyutunda çalışır; backbone f
+        # projektörden ÖNCE okunur (downstream/eff_rank değişmez). Default
+        # kapalı → v6 davranışı (T'ler backbone feat_dim'inde, projektör yok).
+        self.use_projector = use_projector
+        if use_projector:
+            self.projector = ProjectionHead(feat_dim, proj_hidden_dim, proj_dim).to(device)
+            t_dim = proj_dim
+        else:
+            self.projector = None
+            t_dim = feat_dim
+
         # GASP bileşenleri
         # T_nat: natural loss (eşleşmiş farklı içerik, ölçekler arası).
         self.transform = ScaleEquivariantTransform(
-            feat_dim=feat_dim, hidden_dim=T_hidden_dim,
+            feat_dim=t_dim, hidden_dim=T_hidden_dim,
         ).to(device)
         # T_ctrl: controlled loss (aynı içerik, saf yeniden-ölçekleme) — AYRI head
         # (§10.41). Tek T paylaşımında L_nat, T'yi L_ctrl optimumundan sürüklüyordu:
         # paylaşılan T chance'te sıkışırken bağımsız T_ctrl ~%20 chance altına iner.
         # Encoder ortak kalır → eşdeğişirlik encoder düzeyinde; downstream T kullanmaz.
         self.transform_ctrl = ScaleEquivariantTransform(
-            feat_dim=feat_dim, hidden_dim=T_hidden_dim,
+            feat_dim=t_dim, hidden_dim=T_hidden_dim,
         ).to(device)
         self.sampler = MultiScalePatchSampler(
             scales=scales,
@@ -160,6 +177,16 @@ class GASPTrainer:
         # Çoklu scale durumunda dinamik seçim _step içinde yapılır.
 
         self.loss_history: list = []
+
+    def _project(self, feat: torch.Tensor) -> torch.Tensor:
+        """v7: backbone feature'ını kayıp uzayına (z) eşle.
+
+        use_projector=False ise kimlik (v6 davranışı). True ise projektör
+        çıktısı; kayıplar burada çalışır, backbone f projektörden önce okunur.
+        """
+        if self.use_projector:
+            return self.projector(feat)
+        return feat
 
     def _encode(self, patches: torch.Tensor, use_ema: bool = False) -> torch.Tensor:
         """Yama batch'ini feature vektörlerine çevir (MoCo-v3 paterni).
@@ -226,7 +253,7 @@ class GASPTrainer:
         if self.loss_variant == "F":
             ctrl_out = controlled_loss_F(
                 patches=patches,
-                encoder=lambda x: self._encode(x, use_ema=False),
+                encoder=lambda x: self._project(self._encode(x, use_ema=False)),
                 transform=self.transform_ctrl,
                 scale_a=scale_a,
                 scale_b=scale_b,
@@ -248,6 +275,10 @@ class GASPTrainer:
         # L_doğal — F varyantı: InfoNCE on log_r; vanilla: symmetric L2
         online_feats = self._encode(patches, use_ema=False)
         ema_feats = self._encode(patches, use_ema=True)
+        # v7: kayıplar projektör çıktısında (z). use_projector=False ise
+        # _project kimliktir → online_z is online_feats (v6 davranışı).
+        online_z = self._project(online_feats)
+        ema_z = self._project(ema_feats)
         if self.loss_variant == "F":
             # Aday log_r set: tüm olası scale çiftleri (ctrl ile aynı set).
             # Hem +log_r hem -log_r olası yönlerini içersin (symmetric).
@@ -259,8 +290,8 @@ class GASPTrainer:
                     device=self.device,
                 )
             nat_out = natural_loss_F(
-                online_features=online_feats,
-                ema_features=ema_feats,
+                online_features=online_z,
+                ema_features=ema_z,
                 log_scales=log_scales,
                 image_ids=image_ids,
                 matcher=self.matcher,
@@ -270,8 +301,8 @@ class GASPTrainer:
             )
         else:
             nat_out = natural_loss(
-                online_features=online_feats,
-                ema_features=ema_feats,
+                online_features=online_z,
+                ema_features=ema_z,
                 log_scales=log_scales,
                 image_ids=image_ids,
                 matcher=self.matcher,
@@ -282,17 +313,19 @@ class GASPTrainer:
         # GASP'ın "bilgi koruma" şartı; T tabanlı tutarlılıkla birlikte
         # eşdeğişirliğin varlık şartını oluşturur.
         reg_out = feature_regularization_loss(
-            online_feats,
+            online_z,
             variance_target=self.variance_target,
         )
         L_var = reg_out["variance"]
         L_cov = reg_out["covariance"]
+        L_iso = reg_out["isotropy"]
 
         total = (
             self.alpha * ctrl_out["loss"]
             + nat_out["loss"]
             + self.lambda_var * L_var
             + self.lambda_cov * L_cov
+            + self.lambda_iso * L_iso
         )
         return {
             "loss": total,
@@ -300,6 +333,7 @@ class GASPTrainer:
             "L_nat": float(nat_out["loss"].detach()) if nat_out["n_pairs"] > 0 else 0.0,
             "L_var": float(L_var.detach()),
             "L_cov": float(L_cov.detach()),
+            "L_iso": float(L_iso.detach()),
             "n_pairs": nat_out["n_pairs"],
         }
 
@@ -331,6 +365,8 @@ class GASPTrainer:
             + list(self.transform.parameters())
             + list(self.transform_ctrl.parameters())
         )
+        if self.use_projector:
+            params = params + list(self.projector.parameters())
         optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
         steps_per_epoch = len(dl)
@@ -353,6 +389,8 @@ class GASPTrainer:
             self.transform.load_state_dict(ckpt["transform"])
             if "transform_ctrl" in ckpt:        # eski ckpt'lerde yok (geriye-uyum)
                 self.transform_ctrl.load_state_dict(ckpt["transform_ctrl"])
+            if self.use_projector and "projector" in ckpt:
+                self.projector.load_state_dict(ckpt["projector"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
             start_epoch = ckpt["epoch"] + 1
@@ -362,7 +400,7 @@ class GASPTrainer:
         for epoch in range(start_epoch, epochs + 1):
             t0 = time.time()
             ep_loss = 0.0; ep_ctrl = 0.0; ep_nat = 0.0
-            ep_var = 0.0; ep_cov = 0.0; ep_pairs = 0; nb = 0
+            ep_var = 0.0; ep_cov = 0.0; ep_iso = 0.0; ep_pairs = 0; nb = 0
             for imgs in dl:
                 optimizer.zero_grad(set_to_none=True)
                 out = self._step(imgs)
@@ -377,6 +415,7 @@ class GASPTrainer:
                 ep_nat += out["L_nat"]
                 ep_var += out["L_var"]
                 ep_cov += out["L_cov"]
+                ep_iso += out["L_iso"]
                 ep_pairs += out["n_pairs"]
                 nb += 1
             avg_loss = ep_loss / nb
@@ -384,11 +423,12 @@ class GASPTrainer:
             avg_nat = ep_nat / nb
             avg_var = ep_var / nb
             avg_cov = ep_cov / nb
+            avg_iso = ep_iso / nb
             avg_pairs = ep_pairs / nb
             self.loss_history.append({
                 "epoch": epoch, "loss": avg_loss,
                 "L_ctrl": avg_ctrl, "L_nat": avg_nat,
-                "L_var": avg_var, "L_cov": avg_cov,
+                "L_var": avg_var, "L_cov": avg_cov, "L_iso": avg_iso,
                 "n_pairs_avg": avg_pairs,
                 "T_identity_dist": float(self.transform.identity_distance(
                     torch.tensor([[0.5]], device=self.device)
@@ -397,7 +437,7 @@ class GASPTrainer:
             if epoch % print_every == 0:
                 print(f"[gasp] epoch {epoch}/{epochs} loss={avg_loss:.4f} "
                       f"L_ctrl={avg_ctrl:.4f} L_nat={avg_nat:.4f} "
-                      f"L_var={avg_var:.4f} L_cov={avg_cov:.4f} "
+                      f"L_var={avg_var:.4f} L_cov={avg_cov:.4f} L_iso={avg_iso:.4f} "
                       f"pairs/batch={avg_pairs:.1f} ({time.time()-t0:.1f}s)")
             if epoch % save_every == 0 or epoch == epochs:
                 self._save(output, epoch, optimizer, scheduler)
@@ -406,7 +446,7 @@ class GASPTrainer:
 
     def _save(self, output: str, epoch: int, optimizer, scheduler) -> None:
         os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
-        torch.save({
+        resume_ckpt = {
             "model": self.model.state_dict(),
             "ema_model": self.ema_model.state_dict(),
             "transform": self.transform.state_dict(),
@@ -415,7 +455,12 @@ class GASPTrainer:
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,
             "loss_history": self.loss_history,
-        }, output.replace(".pt", ".resume.pt"))
+        }
+        if self.use_projector:
+            resume_ckpt["projector"] = self.projector.state_dict()
+        torch.save(resume_ckpt, output.replace(".pt", ".resume.pt"))
+        # Final/epoch checkpoint: SADECE backbone (projektör atılır, downstream
+        # yalnız backbone'u kullanır → v6/COCO ile birebir karşılaştırılabilir).
         torch.save({"model": self.model.state_dict()},
                    output.replace(".pt", f"_ep{epoch}.pt"))
         with open(output.replace(".pt", "_loss_history.json"), "w") as f:

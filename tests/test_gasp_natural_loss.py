@@ -10,6 +10,7 @@ from yolo_contrastive.gasp import (
     NaturalPairMatcher,
     natural_loss,
 )
+from yolo_contrastive.gasp.losses import natural_loss_F
 
 
 def _matched_setup():
@@ -117,3 +118,39 @@ class TestNaturalLoss:
                 torch.randn(4, 64), torch.randn(4, 32),
                 torch.zeros(4, 1), torch.zeros(4, dtype=torch.long), m, T,
             )
+
+
+class TestNaturalLossF:
+    """natural_loss_F — cosine (default) ve mse modları, doğrulama."""
+
+    def test_cosine_mode_runs_and_grads(self):
+        online, ema, log_scales, image_ids = _matched_setup()
+        m = NaturalPairMatcher(similarity_threshold=0.7)
+        T = ScaleEquivariantTransform(feat_dim=64, hidden_dim=16)
+        cands = torch.tensor([1.0, -1.0, 0.5])
+        out = natural_loss_F(online, ema, log_scales, image_ids, m, T,
+                             candidate_log_ratios=cands, temperature=0.07,
+                             similarity="cosine")
+        assert out["n_pairs"] == 2
+        assert out["loss"].dim() == 0
+        assert out["mse_real"] >= 0          # similarity'den bağımsız ham MSE
+        out["loss"].backward()
+        assert online.grad is not None and online.grad.abs().sum().item() > 0
+
+    def test_mse_and_cosine_both_run(self):
+        online, ema, log_scales, image_ids = _matched_setup()
+        m = NaturalPairMatcher(similarity_threshold=0.7)
+        T = ScaleEquivariantTransform(feat_dim=64, hidden_dim=16)
+        cands = torch.tensor([1.0, -1.0, 0.5])
+        for sim in ("cosine", "mse"):
+            out = natural_loss_F(online, ema, log_scales, image_ids, m, T,
+                                 candidate_log_ratios=cands, similarity=sim)
+            assert torch.isfinite(out["loss"])
+
+    def test_invalid_similarity_raises(self):
+        online, ema, log_scales, image_ids = _matched_setup()
+        m = NaturalPairMatcher(similarity_threshold=0.7)
+        T = ScaleEquivariantTransform(feat_dim=64, hidden_dim=16)
+        with pytest.raises(ValueError):
+            natural_loss_F(online, ema, log_scales, image_ids, m, T,
+                           similarity="foo")

@@ -292,14 +292,16 @@ def feature_regularization_loss(
         eps: numerik stabilite.
 
     Returns:
-        {"variance": skaler, "covariance": skaler}
+        {"variance": skaler, "covariance": skaler, "isotropy": skaler}
+        isotropy: boyut-varyanslarının normalize varyansı — rank-collapse
+            engeli (kovaryansın kör olduğu varyans-eşitsizliğini cezalar).
     """
     if features.dim() != 2:
         raise ValueError(f"features [N, D] olmalı, alındı: {tuple(features.shape)}")
     if features.shape[0] < 2:
         # tek örnek var — varyans tanımsız, sıfır kayıp
         zero = torch.zeros((), device=features.device, dtype=features.dtype)
-        return {"variance": zero, "covariance": zero}
+        return {"variance": zero, "covariance": zero, "isotropy": zero}
 
     N, D = features.shape
 
@@ -318,7 +320,24 @@ def feature_regularization_loss(
     off_diag_mask = ~torch.eye(D, dtype=torch.bool, device=features.device)
     covariance_loss = (cov[off_diag_mask] ** 2).sum() / D
 
-    return {"variance": variance_loss, "covariance": covariance_loss}
+    # ── Isotropy loss (rank-collapse engeli) ──
+    # Kovaryans terimi varyans-EŞİTSİZLİĞİNE kördür: boyutlar dik (cov≈0)
+    # olsa bile varyans birkaç boyuta yığılırsa eff_rank düşer (boyutsal
+    # collapse). Statik kanıt: çökmüş (eff_rank 20) ve sağlıklı (eff_rank
+    # 205) feature için cov_loss aynı çıkar. Bu terim boyut-varyanslarının
+    # normalize varyansını (varyasyon katsayısı²) cezalar: tüm varyanslar
+    # eşitse ≈0, birkaç boyuta yığılıysa yüksek (çökmüşte ~24 vs sağlıklı
+    # ~0.01). Ölçek-bağımsız (mean² ile normalize → γ kalibrasyonu yok).
+    # Variance floor ile birlikte: floor global-sıfır-collapse'ı, isotropy
+    # varyans-yığılmasını engeller.
+    var_per_dim = centered.var(dim=0)                          # [D]
+    isotropy_loss = var_per_dim.var() / (var_per_dim.mean() ** 2 + eps)
+
+    return {
+        "variance": variance_loss,
+        "covariance": covariance_loss,
+        "isotropy": isotropy_loss,
+    }
 
 
 
@@ -477,6 +496,7 @@ def natural_loss_F(
     transform,
     candidate_log_ratios: torch.Tensor = None,
     temperature: float = 0.2,
+    similarity: str = "cosine",
 ) -> dict:
     """L_doğal_F — sahte-dönüşüm-aware natural loss (GASP §10.37).
 
@@ -494,6 +514,9 @@ def natural_loss_F(
         matcher: NaturalPairMatcher.
         transform: ScaleEquivariantTransform.
         temperature: InfoNCE sıcaklığı (default 0.2).
+        similarity: "cosine" (default, L2-normalize edilmiş cosine — genlik
+            collapse'ına dayanıklı, controlled_loss_F ile tutarlı) veya
+            "mse" (eski ham kare-L2, genliğe duyarlı).
 
     Returns:
         {"loss": skaler, "n_pairs": int, "mse_real": float}
@@ -504,6 +527,8 @@ def natural_loss_F(
         raise ValueError(f"online {online_features.shape} ve ema {ema_features.shape} eşit değil")
     if temperature <= 0:
         raise ValueError(f"temperature > 0 olmalı, alındı: {temperature}")
+    if similarity not in ("cosine", "mse"):
+        raise ValueError(f"similarity 'cosine' veya 'mse' olmalı, alındı: {similarity}")
 
     device = online_features.device
     dtype = online_features.dtype
@@ -551,8 +576,11 @@ def natural_loss_F(
     log_r_tiled = all_log_r.unsqueeze(1).expand(K, M).reshape(K * M, 1)
     f_a_T = transform(f_a_tiled, log_r_tiled).reshape(K, M, -1)
     f_b_exp = f_b.unsqueeze(0).expand(K, M, -1)
-    d_fwd = ((f_a_T - f_b_exp) ** 2).mean(dim=-1)   # [K, M]
-    logits_fwd = -d_fwd / temperature
+    d_fwd = ((f_a_T - f_b_exp) ** 2).mean(dim=-1)   # [K, M] — ham MSE (diagnostik)
+    if similarity == "cosine":
+        logits_fwd = F.cosine_similarity(f_a_T, f_b_exp, dim=-1) / temperature
+    else:
+        logits_fwd = -d_fwd / temperature
     log_probs_fwd = F.log_softmax(logits_fwd, dim=0)
     loss_fwd = -log_probs_fwd[target, torch.arange(M, device=device)].mean()
 
@@ -562,7 +590,10 @@ def natural_loss_F(
     f_b_T = transform(f_b_tiled, neg_log_r_tiled).reshape(K, M, -1)
     f_a_exp = f_a.unsqueeze(0).expand(K, M, -1)
     d_bwd = ((f_b_T - f_a_exp) ** 2).mean(dim=-1)
-    logits_bwd = -d_bwd / temperature
+    if similarity == "cosine":
+        logits_bwd = F.cosine_similarity(f_b_T, f_a_exp, dim=-1) / temperature
+    else:
+        logits_bwd = -d_bwd / temperature
     log_probs_bwd = F.log_softmax(logits_bwd, dim=0)
     # Backward yönde "doğru" -log_r için: -all_log_r[target] ≈ -log_r[m]
     # Yani target aynı kalır (negation symmetric)
