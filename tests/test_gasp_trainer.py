@@ -196,3 +196,71 @@ class TestGASPProjectorV7:
                       for p in t.projector.parameters())
         assert bb_grad, "backbone gradient almalı (z=proj(f), f backbone'dan)"
         assert pj_grad, "projektör gradient almalı"
+
+
+class TestGASPReconstructionV8:
+    """v8: çapraz-ölçek rekonstrüksiyon — İÇERİK eksenini zorlayan yapısal anti-collapse."""
+
+    def test_decoder_shape_and_range(self):
+        from yolo_contrastive.gasp.reconstruction import ScaleConditionedDecoder
+        dec = ScaleConditionedDecoder(in_channels=128, out_size=64, base=64)
+        out = dec(torch.randn(4, 128, 2, 2), torch.zeros(4, 1))
+        assert out.shape == (4, 3, 64, 64)
+        assert (out >= 0).all() and (out <= 1).all(), "sigmoid → [0,1] piksel"
+
+    def test_decoder_lighter_than_backbone(self):
+        """Decoder backbone'dan belirgin küçük olmalı — 'kapasiteden değil objektiften'."""
+        from yolo_contrastive.gasp.reconstruction import ScaleConditionedDecoder
+        dec = ScaleConditionedDecoder(in_channels=256, out_size=64, base=128)
+        n = sum(p.numel() for p in dec.parameters())
+        assert n < 1_000_000, f"decoder çok büyük ({n:,}); hafif olmalı"
+
+    def test_default_no_reconstruction_is_v6v7(self):
+        """use_reconstruction=False (default) → decoder yok, _step'te L_recon=0."""
+        t = _make_trainer()
+        assert t.use_reconstruction is False
+        assert t.decoder is None
+        out = t._step(torch.randn(2, 3, 128, 128))
+        assert out["L_recon"] == 0.0, "rekonstrüksiyon kapalıyken L_recon sıfır"
+
+    def test_encode_spatial_returns_map_not_vector(self):
+        """_encode_spatial GAP ÖNCESİ uzamsal harita döner; _encode havuzlanmış vektör."""
+        t = _make_trainer()
+        patches = torch.randn(4, 3, 64, 64)
+        vec = t._encode(patches, use_ema=False)
+        spat = t._encode_spatial(patches)
+        assert vec.dim() == 2, "GAP vektörü [N, D]"
+        assert spat.dim() == 4, "uzamsal harita [N, C, h, w]"
+        assert spat.shape[1] == vec.shape[1], "kanal sayısı = feat_dim"
+        assert spat.shape[2] > 1 or spat.shape[3] > 1, "uzamsal boyut korunmalı (havuzlanmamış)"
+
+    def test_step_runs_with_reconstruction(self):
+        t = _make_trainer(use_reconstruction=True, lambda_recon=1.0, recon_base_dim=64)
+        out = t._step(torch.randn(2, 3, 128, 128))
+        for key in ("loss", "L_ctrl", "L_nat", "L_recon"):
+            assert key in out
+        assert out["L_recon"] > 0.0, "rekonstrüksiyon açıkken L_recon pozitif"
+        assert torch.isfinite(out["loss"]), "v8 step kaybı sonlu olmalı"
+        assert out["loss"].requires_grad
+
+    def test_reconstruction_grads_flow_to_backbone(self):
+        """Rekonstrüksiyon kaybı backbone'u şekillendirmeli (içerik eksenini zorlar)."""
+        t = _make_trainer(use_reconstruction=True, lambda_recon=1.0, recon_base_dim=64,
+                          lambda_var=0.0, lambda_cov=0.0, lambda_iso=0.0, alpha=0.0)
+        # alpha=0 + reg=0 → kayıp NEREDEYSE yalnız rekonstrüksiyon (+nat); backbone grad recon'dan
+        out = t._step(torch.randn(2, 3, 128, 128))
+        out["loss"].backward()
+        bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                      for p in t.model.parameters())
+        dec_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                       for p in t.decoder.parameters())
+        assert bb_grad, "backbone gradient almalı (rekonstrüksiyon onu zorlar)"
+        assert dec_grad, "decoder gradient almalı"
+
+    def test_reconstruction_and_projector_coexist(self):
+        """v7 + v8 birlikte çalışabilmeli (ortogonal mekanizmalar)."""
+        t = _make_trainer(use_projector=True, proj_dim=96,
+                          use_reconstruction=True, recon_base_dim=64)
+        out = t._step(torch.randn(2, 3, 128, 128))
+        assert torch.isfinite(out["loss"])
+        assert out["L_recon"] > 0.0

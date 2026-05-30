@@ -34,6 +34,7 @@ from .transform import ScaleEquivariantTransform, ProjectionHead
 from .patch_sampler import MultiScalePatchSampler
 from .natural_pair import NaturalPairMatcher
 from .losses import controlled_loss, natural_loss, feature_regularization_loss, controlled_loss_F, natural_loss_F
+from .reconstruction import ScaleConditionedDecoder, cross_scale_reconstruction_loss
 from ..dense.multi_scale_tap import MultiScaleFeatureTap
 
 
@@ -81,6 +82,10 @@ class GASPTrainer:
         use_projector: bool = False,
         proj_hidden_dim: int = 512,
         proj_dim: int = 256,
+        use_reconstruction: bool = False,
+        lambda_recon: float = 1.0,
+        recon_base_dim: int = 128,
+        recon_gap_bottleneck: bool = False,
     ):
         if not (0.0 <= momentum < 1.0):
             raise ValueError(f"momentum ∈ [0, 1), got {momentum}")
@@ -143,6 +148,21 @@ class GASPTrainer:
         else:
             self.projector = None
             t_dim = feat_dim
+
+        # v8: çapraz-ölçek rekonstrüksiyon decoder'ı. use_reconstruction=True ise
+        # backbone'un P5 uzamsal haritasından (GAP öncesi) hedef yamayı yeniden
+        # üretir — İÇERİK eksenini zorlar (collapse'ın kök nedeni: bu eksen yoktu).
+        # Decoder yalnız resume checkpoint'inde saklanır; final/epoch checkpoint
+        # SADECE backbone (decoder atılır → downstream/COCO ile birebir kıyas).
+        self.use_reconstruction = use_reconstruction
+        self.lambda_recon = lambda_recon
+        if use_reconstruction:
+            self.decoder = ScaleConditionedDecoder(
+                in_channels=feat_dim, out_size=target_patch_size, base=recon_base_dim,
+                gap_bottleneck=recon_gap_bottleneck,
+            ).to(device)
+        else:
+            self.decoder = None
 
         # GASP bileşenleri
         # T_nat: natural loss (eşleşmiş farklı içerik, ölçekler arası).
@@ -215,6 +235,18 @@ class GASPTrainer:
             _ = self.model(patches)
             feat = self.online_tap.get_features()[self.feat_level]
             return F.adaptive_avg_pool2d(feat, 1).flatten(1)
+
+    def _encode_spatial(self, patches: torch.Tensor) -> torch.Tensor:
+        """Yama batch'ini GAP ÖNCESİ uzamsal feature haritasına çevir (v8).
+
+        `_encode` ile aynı tap, ama adaptive_avg_pool YOK — [N, C, h, w] döner
+        (64px yamada P5 ~2×2). Rekonstrüksiyon decoder'ı bunu girdi alır.
+        Gradyanlı online encoder (backbone'u şekillendirir → P5 zenginleşir,
+        GAP-vektörünün rank'ı da yükselir).
+        """
+        self.online_tap.clear()
+        _ = self.model(patches)
+        return self.online_tap.get_features()[self.feat_level]
 
     @torch.no_grad()
     def _ema_update(self) -> None:
@@ -320,12 +352,29 @@ class GASPTrainer:
         L_cov = reg_out["covariance"]
         L_iso = reg_out["isotropy"]
 
+        # v8: çapraz-ölçek rekonstrüksiyon — İÇERİK eksenini zorlar (yapısal
+        # anti-collapse). view_a'yı (scale_a) P5 uzamsal haritasına encode eder,
+        # log_r ile koşullu decoder ile view_b'yi (scale_b) yeniden üretir.
+        # Aynı scale_a/scale_b çiftini kullanır (controlled ile tutarlı).
+        L_recon = torch.zeros((), device=self.device)
+        if self.use_reconstruction:
+            rec_out = cross_scale_reconstruction_loss(
+                patches=patches,
+                encoder_spatial=self._encode_spatial,
+                decoder=self.decoder,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                target_patch_size=self.target_patch_size,
+            )
+            L_recon = rec_out["loss"]
+
         total = (
             self.alpha * ctrl_out["loss"]
             + nat_out["loss"]
             + self.lambda_var * L_var
             + self.lambda_cov * L_cov
             + self.lambda_iso * L_iso
+            + self.lambda_recon * L_recon
         )
         return {
             "loss": total,
@@ -334,6 +383,7 @@ class GASPTrainer:
             "L_var": float(L_var.detach()),
             "L_cov": float(L_cov.detach()),
             "L_iso": float(L_iso.detach()),
+            "L_recon": float(L_recon.detach()),
             "n_pairs": nat_out["n_pairs"],
         }
 
@@ -367,6 +417,8 @@ class GASPTrainer:
         )
         if self.use_projector:
             params = params + list(self.projector.parameters())
+        if self.use_reconstruction:
+            params = params + list(self.decoder.parameters())
         optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
         steps_per_epoch = len(dl)
@@ -391,6 +443,8 @@ class GASPTrainer:
                 self.transform_ctrl.load_state_dict(ckpt["transform_ctrl"])
             if self.use_projector and "projector" in ckpt:
                 self.projector.load_state_dict(ckpt["projector"])
+            if self.use_reconstruction and "decoder" in ckpt:
+                self.decoder.load_state_dict(ckpt["decoder"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
             start_epoch = ckpt["epoch"] + 1
@@ -400,7 +454,7 @@ class GASPTrainer:
         for epoch in range(start_epoch, epochs + 1):
             t0 = time.time()
             ep_loss = 0.0; ep_ctrl = 0.0; ep_nat = 0.0
-            ep_var = 0.0; ep_cov = 0.0; ep_iso = 0.0; ep_pairs = 0; nb = 0
+            ep_var = 0.0; ep_cov = 0.0; ep_iso = 0.0; ep_recon = 0.0; ep_pairs = 0; nb = 0
             for imgs in dl:
                 optimizer.zero_grad(set_to_none=True)
                 out = self._step(imgs)
@@ -416,6 +470,7 @@ class GASPTrainer:
                 ep_var += out["L_var"]
                 ep_cov += out["L_cov"]
                 ep_iso += out["L_iso"]
+                ep_recon += out.get("L_recon", 0.0)
                 ep_pairs += out["n_pairs"]
                 nb += 1
             avg_loss = ep_loss / nb
@@ -424,20 +479,24 @@ class GASPTrainer:
             avg_var = ep_var / nb
             avg_cov = ep_cov / nb
             avg_iso = ep_iso / nb
+            avg_recon = ep_recon / nb
             avg_pairs = ep_pairs / nb
             self.loss_history.append({
                 "epoch": epoch, "loss": avg_loss,
                 "L_ctrl": avg_ctrl, "L_nat": avg_nat,
                 "L_var": avg_var, "L_cov": avg_cov, "L_iso": avg_iso,
+                "L_recon": avg_recon,
                 "n_pairs_avg": avg_pairs,
                 "T_identity_dist": float(self.transform.identity_distance(
                     torch.tensor([[0.5]], device=self.device)
                 ).item()),
             })
             if epoch % print_every == 0:
+                _recon_str = f"L_recon={avg_recon:.4f} " if self.use_reconstruction else ""
                 print(f"[gasp] epoch {epoch}/{epochs} loss={avg_loss:.4f} "
                       f"L_ctrl={avg_ctrl:.4f} L_nat={avg_nat:.4f} "
                       f"L_var={avg_var:.4f} L_cov={avg_cov:.4f} L_iso={avg_iso:.4f} "
+                      f"{_recon_str}"
                       f"pairs/batch={avg_pairs:.1f} ({time.time()-t0:.1f}s)")
             if epoch % save_every == 0 or epoch == epochs:
                 self._save(output, epoch, optimizer, scheduler)
@@ -458,6 +517,8 @@ class GASPTrainer:
         }
         if self.use_projector:
             resume_ckpt["projector"] = self.projector.state_dict()
+        if self.use_reconstruction:
+            resume_ckpt["decoder"] = self.decoder.state_dict()
         torch.save(resume_ckpt, output.replace(".pt", ".resume.pt"))
         # Final/epoch checkpoint: SADECE backbone (projektör atılır, downstream
         # yalnız backbone'u kullanır → v6/COCO ile birebir karşılaştırılabilir).
