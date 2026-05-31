@@ -134,7 +134,7 @@ def _write_split_dir(out_dir: Path, splits: dict[str, list[Path]], names: list[s
     for split, paths in splits.items():
         txt = out_dir / f"{split}.txt"
         txt.write_text("".join(f"{p}\n" for p in paths))
-        entries[split] = str(txt)
+        entries[split] = str(txt.resolve())   # absolute → Ultralytics/fraction never path-double
     data: dict = {"train": entries["train"], "val": entries["val"]}
     if "test" in entries:
         data["test"] = entries["test"]
