@@ -314,12 +314,15 @@ class TestRunName:
 
 
 class TestRequiredFields:
-    def test_missing_backbone_ckpt_raises(self):
+    def test_baseline_no_backbone_ckpt_runs(self):
+        """Baseline cell: no backbone_ckpt, method carries base_model — must NOT raise."""
         from yolo_contrastive.eval.run_matrix import _run_detection
         cell = _basic_cell()
-        cell["method"]["backbone_ckpt"] = ""
-        with pytest.raises(ValueError, match="backbone_ckpt"):
-            _run_detection(cell, _basic_hp())
+        cell["method"] = {"name": "scratch", "base_model": "yolov8n.yaml"}  # no backbone_ckpt
+        out = _run_detection(cell, _basic_hp(base_model="yolov8n.pt"))
+        assert _MockYOLO.train_call_count == 1
+        assert _MockYOLO.last_init == "yolov8n.yaml"   # per-method base_model overrides hp
+        assert "metric_value" in out
 
     def test_missing_data_yaml_raises(self):
         from yolo_contrastive.eval.run_matrix import _run_detection

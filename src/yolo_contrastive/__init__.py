@@ -71,6 +71,8 @@ _LAZY_EXPORTS = {
     # ── evaluation ────────────────────────────────────────────────────
     "LinearProbeTrainer": "eval",
     "RunMatrix": "eval",
+    "run_cv_eval": "eval.cross_val",
+    "aggregate_cv_results": "eval.cross_val",
     "run_leakage_check": "eval.leakage_check",
     # ── fine-tuning ───────────────────────────────────────────────────
     "FinetuneDetectionTrainer": "finetune",

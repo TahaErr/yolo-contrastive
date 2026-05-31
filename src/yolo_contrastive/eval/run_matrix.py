@@ -74,7 +74,7 @@ except ImportError as e:
 # CSV columns — fixed schema so resume works deterministically
 CSV_COLUMNS = [
     "method", "dataset", "fraction", "seed", "task",
-    "metric", "metric_value",
+    "metric", "metric_value", "mAP50", "precision", "recall",
     "status",          # "ok" | "failed" | "skipped"
     "elapsed_s", "error", "started_at",
 ]
@@ -188,7 +188,12 @@ def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
         project:              output directory, default "/content/runs/eval_matrix"
 
     Cell-level reads:
-        cell["method"]["backbone_ckpt"]   SSL backbone (env var YCL_PRETRAINED)
+        cell["method"]["backbone_ckpt"]   SSL backbone, optional (env YCL_PRETRAINED);
+                                          omit for baselines (e.g. COCO/scratch) that
+                                          initialise from base_model alone
+        cell["method"]["base_model"]      per-method base model override (e.g.
+                                          "yolov8n.yaml" for random-init scratch);
+                                          falls back to hp["base_model"]
         cell["dataset"]["data_yaml"]      Ultralytics data.yaml path
         cell["cell_id"]                   8-char short id for run name (if present)
         cell["seed"]                      passed to torch.manual_seed
@@ -222,12 +227,7 @@ def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
     from ..finetune import FinetuneDetectionTrainer  # noqa: F401 — registers trainer
 
     # ── read cell + hp with defaults ─────────────────────────────────────
-    backbone_ckpt = cell["method"].get("backbone_ckpt")
-    if not backbone_ckpt:
-        raise ValueError(
-            "_run_detection requires cell['method']['backbone_ckpt']; "
-            "got missing/empty value"
-        )
+    backbone_ckpt = cell["method"].get("backbone_ckpt")  # optional: baselines carry none
 
     data_yaml = cell["dataset"].get("data_yaml")
     if not data_yaml:
@@ -236,7 +236,7 @@ def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
             "got missing/empty value"
         )
 
-    base_model = hp.get("base_model", "yolov8n.pt")
+    base_model = cell["method"].get("base_model", hp.get("base_model", "yolov8n.pt"))
     epochs = int(hp.get("epochs", 30))
     imgsz = int(hp.get("imgsz", 640))
     batch = int(hp.get("batch", 16))
@@ -271,7 +271,7 @@ def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
 
     # ── env var pattern: set, run, restore (lifecycle isolation) ─────────
     env_overrides = {
-        "YCL_PRETRAINED": str(backbone_ckpt),
+        "YCL_PRETRAINED": str(backbone_ckpt) if backbone_ckpt else "",
         "YCL_FREEZE_BACKBONE": str(freeze),
         "YCL_UNFREEZE_EPOCH": str(unfreeze_epoch),
         "YCL_BACKBONE_LR_SCALE": str(backbone_lr_scale),
@@ -568,6 +568,9 @@ class RunMatrix:
                 out = runner(cell, cell["hp"])
                 row["metric"] = out.get("metric", "")
                 row["metric_value"] = out.get("metric_value", "")
+                for _extra in ("mAP50", "precision", "recall"):
+                    if _extra in out:
+                        row[_extra] = out[_extra]
                 row["status"] = "ok"
                 row["elapsed_s"] = round(time.time() - t0, 2)
                 if verbose:
