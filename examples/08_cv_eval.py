@@ -40,6 +40,8 @@ def main() -> None:
                    help="0 = full fine-tune; 10 = frozen backbone (probe-like)")
     p.add_argument("--baselines", nargs="*", default=[], choices=["coco", "scratch"],
                    help="control methods run through the same folds (e.g. --baselines coco scratch)")
+    p.add_argument("--fractions", nargs="+", type=float, default=[1.0],
+                   help="train-set fractions, e.g. --fractions 0.1 0.5 1.0")
     p.add_argument("--metric", default="mAP50", choices=["mAP50", "metric_value"],
                    help="metric to aggregate (metric_value = mAP50-95)")
     p.add_argument("--no-resume", action="store_true")
@@ -48,7 +50,8 @@ def main() -> None:
     hp = {"epochs": args.epochs, "imgsz": args.imgsz, "batch": args.batch,
           "device": args.device, "freeze": args.freeze}
     run_cv_eval(args.backbones, args.folds, args.out, seed=args.seed, hp=hp,
-                baselines=args.baselines, resume=not args.no_resume, metric=args.metric)
+                baselines=args.baselines, fractions=args.fractions,
+                resume=not args.no_resume, metric=args.metric)
 
 
 if __name__ == "__main__":

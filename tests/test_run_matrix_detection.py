@@ -237,6 +237,24 @@ class TestHyperparamForward:
         _run_detection(_basic_cell(), _basic_hp(base_model="yolov8s.pt"))
         assert _MockYOLO.last_init == "yolov8s.pt"
 
+    def test_freeze_and_optimizer_forwarded_to_train(self):
+        """freeze always reaches YOLO.train (so baselines freeze too); optimizer/lr0
+        forwarded when set in hp."""
+        from yolo_contrastive.eval.run_matrix import _run_detection
+        _run_detection(_basic_cell(), _basic_hp(freeze=10, optimizer="AdamW", lr0=1e-3))
+        kw = _MockYOLO.last_train_kwargs
+        assert kw["freeze"] == 10
+        assert kw["optimizer"] == "AdamW"
+        assert kw["lr0"] == 1e-3
+
+    def test_unset_optimizer_not_forwarded(self):
+        """When optimizer is absent from hp, it is not passed (Ultralytics default)."""
+        from yolo_contrastive.eval.run_matrix import _run_detection
+        hp = _basic_hp()
+        hp.pop("optimizer", None)
+        _run_detection(_basic_cell(), hp)
+        assert "optimizer" not in _MockYOLO.last_train_kwargs
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # (c) Return shape contract
@@ -367,3 +385,56 @@ class TestRunMatrixIntegration:
         assert results[0]["status"] == "ok"
         assert results[0]["metric"] == "mAP50-95"
         assert _MockYOLO.train_call_count == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# (i) Label-fraction subsetting of the train set
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestFractionSubsample:
+    def test_fraction_train_yaml_subsets_and_nests(self, tmp_path, monkeypatch):
+        import os
+
+        import yaml
+        from yolo_contrastive.eval.run_matrix import _fraction_train_yaml
+
+        monkeypatch.chdir(tmp_path)          # so a RELATIVE workdir would expose path-doubling
+        train_txt = tmp_path / "train.txt"
+        imgs = [f"/data/src{i % 4}/images/img{i:03d}.jpg" for i in range(20)]
+        train_txt.write_text("\n".join(imgs) + "\n")
+        dy = tmp_path / "data.yaml"
+        with open(dy, "w") as f:
+            yaml.safe_dump({"train": str(train_txt), "val": "/v.txt", "nc": 1,
+                            "names": ["pothole"]}, f)
+
+        c50 = yaml.safe_load(open(_fraction_train_yaml(str(dy), 0.5, 0, "frac")))  # RELATIVE workdir
+        assert os.path.isabs(c50["train"])           # regression: train path must be absolute
+        sub50 = [ln.strip() for ln in open(c50["train"]) if ln.strip()]
+        assert len(sub50) == 10                      # 50% of 20
+        assert c50["val"] == "/v.txt" and c50["nc"] == 1   # val / nc unchanged
+
+        c10 = yaml.safe_load(open(_fraction_train_yaml(str(dy), 0.1, 0, "frac")))
+        sub10 = [ln.strip() for ln in open(c10["train"]) if ln.strip()]
+        assert len(sub10) == 2                       # 10% of 20
+        assert set(sub10) <= set(sub50)              # nested (same seed)
+
+    def test_run_detection_fraction_lt_one_trains_on_subset(self, tmp_path):
+        import yaml
+        from yolo_contrastive.eval.run_matrix import _run_detection
+
+        train_txt = tmp_path / "train.txt"
+        train_txt.write_text("\n".join(f"/d/images/i{i}.jpg" for i in range(20)) + "\n")
+        dy = tmp_path / "data.yaml"
+        with open(dy, "w") as f:
+            yaml.safe_dump({"train": str(train_txt), "val": "/v.txt", "nc": 1,
+                            "names": ["x"]}, f)
+
+        cell = _basic_cell(fraction=0.5)
+        cell["dataset"] = {"name": "fold_0", "data_yaml": str(dy)}
+        _run_detection(cell, _basic_hp(project=str(tmp_path / "runs")))
+
+        used = _MockYOLO.last_train_kwargs["data"]
+        assert used != str(dy)                       # a generated subset yaml, not the original
+        sub = [ln.strip() for ln in open(yaml.safe_load(open(used))["train"]) if ln.strip()]
+        assert len(sub) == 10                        # trained on 50% of the train list

@@ -164,6 +164,45 @@ def _run_linear_probe(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any
     }
 
 
+def _fraction_train_yaml(data_yaml: str, fraction: float, seed: int,
+                         workdir: str, prefix: str = "") -> str:
+    """Write a temp data.yaml whose train list is a seeded ``fraction`` subset of
+    the original train images (val / nc / names unchanged).
+
+    Reuses LabelFractionSplitter (uniform deterministic ordering) so that, for a
+    fixed seed, the 10% subset is a prefix of the 50% subset is a prefix of 100%
+    (nested) — the standard label-efficiency setup. The train ref is expected to
+    be a .txt image-list (the CV-fold convention). Returns the temp yaml path.
+    """
+    import os
+
+    import yaml as _yaml
+
+    from ..data.label_fraction import LabelFractionSplitter
+
+    with open(data_yaml) as f:
+        cfg = _yaml.safe_load(f)
+    train_ref = str(cfg.get("train", ""))
+    train_txt = train_ref if os.path.isabs(train_ref) else os.path.join(
+        os.path.dirname(os.path.abspath(data_yaml)), train_ref)
+    with open(train_txt) as f:
+        paths = sorted(ln.strip() for ln in f if ln.strip())
+
+    frac = float(fraction)
+    subset = LabelFractionSplitter([frac], seed=int(seed),
+                                   stratify_mode="none").split(paths)[frac]
+
+    os.makedirs(workdir, exist_ok=True)
+    tag = f"{prefix}f{int(round(frac * 100)):03d}_s{int(seed)}"
+    sub_txt = os.path.abspath(os.path.join(workdir, f"train_{tag}.txt"))
+    with open(sub_txt, "w") as f:
+        f.write("\n".join(subset) + "\n")
+    new_yaml = os.path.abspath(os.path.join(workdir, f"data_{tag}.yaml"))
+    with open(new_yaml, "w") as f:
+        _yaml.safe_dump({**cfg, "train": sub_txt}, f, sort_keys=False)  # absolute → no path-doubling
+    return new_yaml
+
+
 def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
     """Detection runner — YOLO + FinetuneDetectionTrainer integration.
 
@@ -177,15 +216,20 @@ def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
         epochs:               training epochs, default 30
         imgsz:                input image size, default 640
         batch:                batch size, default 16
-        freeze:               freeze layers 0..freeze, default 10
-                              (forwarded to FinetuneDetectionTrainer via
-                              YCL_FREEZE_BACKBONE env var)
+        freeze:               freeze layers 0..freeze, default 10. Forwarded both
+                              to FinetuneDetectionTrainer (YCL_FREEZE_BACKBONE) and
+                              natively to YOLO.train(freeze=), so it applies even to
+                              baselines that load no SSL backbone.
         unfreeze_epoch:       epoch to release frozen layers, default 5
-                              (env var YCL_UNFREEZE_EPOCH)
+                              (env var YCL_UNFREEZE_EPOCH); set >= epochs for a pure
+                              frozen probe (SSL backbone never unfreezes)
         backbone_lr_scale:    LR multiplier for backbone params, default 0.5
-                              (env var YCL_BACKBONE_LR_SCALE)
+                              (ignored when the backbone is frozen — no backbone grads)
         device:               cuda device index, default 0
         project:              output directory, default "/content/runs/eval_matrix"
+        optimizer/lr0/lrf/patience/cos_lr/weight_decay:
+                              forwarded to YOLO.train() when present in hp (else
+                              Ultralytics defaults apply)
 
     Cell-level reads:
         cell["method"]["backbone_ckpt"]   SSL backbone, optional (env YCL_PRETRAINED);
@@ -197,8 +241,9 @@ def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
         cell["dataset"]["data_yaml"]      Ultralytics data.yaml path
         cell["cell_id"]                   8-char short id for run name (if present)
         cell["seed"]                      passed to torch.manual_seed
-        cell["fraction"]                  metadata only (logged, not consumed —
-                                          fraction implicit in dataset.data_yaml)
+        cell["fraction"]                  train-set fraction in (0, 1]; when < 1 a
+                                          seeded subset of the train list is used
+                                          (val unchanged; subsets nested per seed)
 
     Returns:
         {
@@ -245,6 +290,7 @@ def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
     backbone_lr_scale = float(hp.get("backbone_lr_scale", 0.5))
     device = hp.get("device", 0)
     project = hp.get("project", "/content/runs/eval_matrix")
+    fraction = float(cell.get("fraction", 1.0))
 
     # Seed for reproducibility (matches linear_probe runner pattern)
     seed = int(cell.get("seed", 42))
@@ -269,6 +315,13 @@ def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
             f"{cell['dataset']['name']}_seed{seed}"
         )
 
+    # ── label-fraction ablation: seeded subset of the train set (val unchanged) ──
+    if fraction < 1.0:
+        data_yaml = _fraction_train_yaml(
+            data_yaml, fraction, seed,
+            os.path.join(str(project), "_frac_data"),
+            prefix=f"{cell['dataset']['name']}_")
+
     # ── env var pattern: set, run, restore (lifecycle isolation) ─────────
     env_overrides = {
         "YCL_PRETRAINED": str(backbone_ckpt) if backbone_ckpt else "",
@@ -284,7 +337,7 @@ def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
 
         model = YOLO(base_model)
         try:
-            results = model.train(
+            train_kwargs = dict(
                 data=data_yaml,
                 epochs=epochs,
                 imgsz=imgsz,
@@ -296,7 +349,13 @@ def _run_detection(cell: Dict[str, Any], hp: Dict[str, Any]) -> Dict[str, Any]:
                 exist_ok=True,
                 verbose=False,
                 plots=False,
+                freeze=freeze,   # native freeze → applies to baselines too (no SSL load path)
             )
+            # forward standard Ultralytics knobs when set in hp (optimizer, lr, etc.)
+            for _k in ("optimizer", "lr0", "lrf", "patience", "cos_lr", "weight_decay"):
+                if _k in hp:
+                    train_kwargs[_k] = hp[_k]
+            results = model.train(**train_kwargs)
         finally:
             # Free GPU memory before returning so the next cell starts
             # with a clean slate (especially important on smaller GPUs)

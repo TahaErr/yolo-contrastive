@@ -140,14 +140,22 @@ def _baseline_methods(names) -> list[dict]:
 
 def build_cv_matrix(backbones, fold_dir, *, task: str = "detection",
                     seed: int = DEFAULT_SEED, hp: dict | None = None,
-                    baselines=()) -> dict:
-    """Build the RunMatrix config: (backbones + baselines) x folds, fraction=[1.0].
+                    baselines=(), fractions=(1.0,)) -> dict:
+    """Build the RunMatrix config: (backbones + baselines) x folds x fractions.
 
     baselines: iterable of "coco" / "scratch" — control methods run through the
     SAME folds as the SSL backbones, so they get per-fold mean/std on equal footing.
     They carry a ``base_model`` and no ``backbone_ckpt``; ``_run_detection`` then
     initialises from the base model and skips SSL loading.
+
+    fractions: iterable of train-set fractions in (0, 1] (e.g. (0.1, 0.5, 1.0)).
+    Each cell trains on a seeded subset of its fold's train list (val unchanged);
+    subsets are nested per seed. Total runs = methods x folds x fractions.
     """
+    fracs = [float(f) for f in fractions]
+    for f in fracs:
+        if not 0.0 < f <= 1.0:
+            raise ValueError(f"fraction {f} not in (0, 1]")
     methods = load_backbones(backbones) + _baseline_methods(baselines)
     names = [m["name"] for m in methods]
     if len(set(names)) != len(names):
@@ -156,7 +164,7 @@ def build_cv_matrix(backbones, fold_dir, *, task: str = "detection",
         "task": task,
         "methods": methods,
         "datasets": _fold_datasets(fold_dir),
-        "fractions": [1.0],
+        "fractions": fracs,
         "seeds": [int(seed)],
         "hp": {**DEFAULT_HP, **(hp or {})},
     }
@@ -165,7 +173,12 @@ def build_cv_matrix(backbones, fold_dir, *, task: str = "detection",
 # --------------------------------------------------------------------------- aggregate
 def aggregate_cv_results(csv_path: str | Path, *, metric: str = "mAP50",
                          out_path: str | None = None) -> dict:
-    """Group RunMatrix rows by backbone; report across-fold mean/std/min/max."""
+    """Group RunMatrix rows by (backbone, fraction); report across-fold stats.
+
+    Output ``backbones[i]["by_fraction"][f]`` = {n_folds, mean, std, min, max,
+    missing_folds, per_fold}. Backbones are sorted by the largest fraction's mean
+    (full-data performance). Prints a backbone x fraction mean±std table.
+    """
     rows = list(csv.DictReader(open(csv_path, newline="")))
     ok = [r for r in rows if r.get("status") == "ok"]
     failed = [r for r in rows if r.get("status") == "failed"]
@@ -176,40 +189,56 @@ def aggregate_cv_results(csv_path: str | Path, *, metric: str = "mAP50",
             v = r.get("metric_value", "")  # fall back to mAP50-95
         return float(v)
 
-    all_folds = sorted({r["dataset"] for r in ok})
-    per: dict[str, dict[str, float]] = {}
-    for r in ok:
-        per.setdefault(r["method"], {})[r["dataset"]] = _val(r)
+    def _frac(r) -> float:
+        return round(float(r.get("fraction", 1.0) or 1.0), 4)
 
-    backbones = []
-    for name, fold_vals in per.items():
+    fractions = sorted({_frac(r) for r in ok})
+    all_folds = sorted({r["dataset"] for r in ok})
+
+    per: dict[str, dict[float, dict[str, float]]] = {}
+    for r in ok:
+        per.setdefault(r["method"], {}).setdefault(_frac(r), {})[r["dataset"]] = _val(r)
+
+    def _stats(fold_vals: dict[str, float]) -> dict:
         vals = [fold_vals[d] for d in sorted(fold_vals)]
         n = len(vals)
-        backbones.append({
-            "name": name,
+        return {
             "n_folds": n,
             "mean": round(statistics.fmean(vals), 4),
             "std": round(statistics.stdev(vals), 4) if n > 1 else 0.0,
             "min": round(min(vals), 4),
             "max": round(max(vals), 4),
             "missing_folds": [d for d in all_folds if d not in fold_vals],
-            "n_failed": sum(1 for r in failed if r["method"] == name),
             "per_fold": {d: round(fold_vals[d], 4) for d in sorted(fold_vals)},
-        })
-    backbones.sort(key=lambda b: b["mean"], reverse=True)
+        }
 
-    summary = {"metric": metric, "n_folds_total": len(all_folds), "backbones": backbones}
+    backbones = []
+    for name, by_frac in per.items():
+        backbones.append({
+            "name": name,
+            "by_fraction": {f: _stats(by_frac[f]) for f in sorted(by_frac)},
+            "n_failed": sum(1 for r in failed if r["method"] == name),
+        })
+    top = max(fractions) if fractions else 1.0
+    backbones.sort(key=lambda b: b["by_fraction"].get(top, {}).get("mean", -1.0), reverse=True)
+
+    summary = {"metric": metric, "fractions": fractions,
+               "n_folds_total": len(all_folds), "backbones": backbones}
     if out_path is None:
         out_path = str(Path(csv_path).with_suffix("")) + "_summary.json"
     Path(out_path).write_text(json.dumps(summary, indent=2, ensure_ascii=False))
 
-    print(f"\n=== CV leaderboard ({metric}, {len(all_folds)} folds) ===")
-    print(f"  {'backbone':<24}{'mean':>8}{'std':>8}{'min':>8}{'max':>8}{'folds':>7}")
+    print(f"\n=== CV leaderboard ({metric}, {len(all_folds)} folds) — mean±std by data fraction ===")
+    print("  " + f"{'backbone':<24}" + "".join(f"{str(int(f * 100)) + '%':>14}" for f in fractions))
     for b in backbones:
-        incomplete = b["n_folds"] != len(all_folds) or b["n_failed"]
-        flag = "  (incomplete)" if incomplete else ""
-        print(f"  {b['name']:<24}{b['mean']:>8.4f}{b['std']:>8.4f}"
-              f"{b['min']:>8.4f}{b['max']:>8.4f}{b['n_folds']:>7}{flag}")
+        cells = []
+        for f in fractions:
+            s = b["by_fraction"].get(f)
+            cells.append(f"{s['mean']:.3f}±{s['std']:.3f}" if s else "—")
+        incomplete = b["n_failed"] or any(
+            (b["by_fraction"].get(f) or {}).get("n_folds", 0) != len(all_folds) for f in fractions)
+        print("  " + f"{b['name']:<24}" + "".join(f"{c:>14}" for c in cells)
+              + ("  (incomplete)" if incomplete else ""))
     print(f"  -> {out_path}")
     return summary
 
@@ -217,13 +246,14 @@ def aggregate_cv_results(csv_path: str | Path, *, metric: str = "mAP50",
 # --------------------------------------------------------------------------- orchestrator
 def run_cv_eval(backbones, fold_dir, output_csv: str = "runs/cv_results.csv", *,
                 seed: int = DEFAULT_SEED, hp: dict | None = None, baselines=(),
-                resume: bool = True, on_error: str = "continue",
+                fractions=(1.0,), resume: bool = True, on_error: str = "continue",
                 metric: str = "mAP50", runners=None) -> dict:
     """End-to-end: build matrix -> run (resumable) -> aggregate. Returns the summary."""
-    config = build_cv_matrix(backbones, fold_dir, seed=seed, hp=hp, baselines=baselines)
+    config = build_cv_matrix(backbones, fold_dir, seed=seed, hp=hp,
+                             baselines=baselines, fractions=fractions)
     rm = RunMatrix(config=config, output_csv=output_csv, runners=runners)
     cells = rm.expand()
-    print(f"[cv-eval] {len(config['methods'])} backbones x {len(config['datasets'])} "
-          f"folds = {len(cells)} runs -> {output_csv}")
+    print(f"[cv-eval] {len(config['methods'])} methods x {len(config['datasets'])} folds "
+          f"x {len(config['fractions'])} fractions = {len(cells)} runs -> {output_csv}")
     rm.run(resume=resume, on_error=on_error)
     return aggregate_cv_results(output_csv, metric=metric)

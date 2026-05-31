@@ -119,7 +119,33 @@ def test_run_cv_eval_with_baselines(tmp_path):
                     runners={"detection": mock_detect})
     names = {b["name"] for b in s["backbones"]}
     assert names == {"bbA", "coco_baseline", "scratch"}          # baselines aggregated too
-    assert all(b["n_folds"] == 3 for b in s["backbones"])         # each ran on all folds
+    assert all(b["by_fraction"][1.0]["n_folds"] == 3 for b in s["backbones"])  # each ran on all folds
+
+
+# --------------------------------------------------------------------------- fractions
+def test_build_cv_matrix_with_fractions(tmp_path):
+    folds = make_fold_dir(tmp_path, 3)
+    cfg = build_cv_matrix({"bbA": "/a.pt"}, folds, fractions=(0.1, 0.5, 1.0))
+    assert cfg["fractions"] == [0.1, 0.5, 1.0]
+
+
+def test_build_cv_matrix_bad_fraction(tmp_path):
+    folds = make_fold_dir(tmp_path, 3)
+    with pytest.raises(ValueError, match="not in"):
+        build_cv_matrix({"bbA": "/a.pt"}, folds, fractions=(0.0, 1.0))
+
+
+def test_run_cv_eval_with_fractions(tmp_path):
+    folds = make_fold_dir(tmp_path, 3)
+    csv_p = tmp_path / "res.csv"
+    s = run_cv_eval({"bbA": "/a.pt"}, folds, str(csv_p), fractions=(0.1, 0.5, 1.0),
+                    runners={"detection": mock_detect})
+    ok = [r for r in csv.DictReader(open(csv_p)) if r["status"] == "ok"]
+    assert len(ok) == 9                                  # 1 backbone x 3 folds x 3 fractions
+    assert s["fractions"] == [0.1, 0.5, 1.0]
+    bf = s["backbones"][0]["by_fraction"]
+    assert set(bf) == {0.1, 0.5, 1.0} and all(bf[f]["n_folds"] == 3 for f in bf)
+
 
 
 # --------------------------------------------------------------------------- aggregate
@@ -140,12 +166,14 @@ def test_aggregate_mean_std_and_incomplete(tmp_path):
         {"method": "bbB", "dataset": "fold_1", "status": "failed", "error": "boom"},
     ])
     s = aggregate_cv_results(csv_p, metric="mAP50")
+    assert s["fractions"] == [1.0]
     assert [b["name"] for b in s["backbones"]] == ["bbA", "bbB"]  # sorted by mean desc
-    bbA = s["backbones"][0]
+    bbA = s["backbones"][0]["by_fraction"][1.0]
     assert bbA["mean"] == 0.6 and bbA["n_folds"] == 2
     assert abs(bbA["std"] - 0.1414) < 1e-3
     bbB = s["backbones"][1]
-    assert bbB["n_folds"] == 1 and bbB["missing_folds"] == ["fold_1"] and bbB["n_failed"] == 1
+    assert bbB["by_fraction"][1.0]["n_folds"] == 1
+    assert bbB["by_fraction"][1.0]["missing_folds"] == ["fold_1"] and bbB["n_failed"] == 1
 
 
 # --------------------------------------------------------------------------- end-to-end (mock)
@@ -158,10 +186,10 @@ def test_run_cv_eval_end_to_end(tmp_path):
     ok = [r for r in csv.DictReader(open(csv_p)) if r["status"] == "ok"]
     assert len(ok) == 9                                   # 3 backbones x 3 folds
     assert [b["name"] for b in s["backbones"]] == ["bbA", "bbB", "bbC"]
-    assert s["metric"] == "mAP50"
+    assert s["metric"] == "mAP50" and s["fractions"] == [1.0]
     # bbA mAP50 over folds = 0.45, 0.46, 0.47 -> mean 0.46
-    assert s["backbones"][0]["mean"] == 0.46
-    assert all(b["n_folds"] == 3 and not b["n_failed"] for b in s["backbones"])
+    assert s["backbones"][0]["by_fraction"][1.0]["mean"] == 0.46
+    assert all(b["by_fraction"][1.0]["n_folds"] == 3 and not b["n_failed"] for b in s["backbones"])
 
 
 def test_run_cv_eval_resume(tmp_path):
