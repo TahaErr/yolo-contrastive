@@ -31,6 +31,25 @@ Public API (all importable as ``from yolo_contrastive import X``):
   Fine-tuning
     FinetuneDetectionTrainer — YOLO fine-tuning with a pretrained backbone
 
+  Anchored joint training (nature's labels carrier)
+    AnchoredJointTrainer — COCO-replay-anchored joint trainer (R3)
+    AuxChannel           — channel plugin interface
+    save_checkpoint, load_for_finetune — R8 whole-detector transplant I/O
+
+  TERRA (geoteach — road-plane residuals from monocular depth)
+    TerraChannel             — the AuxChannel
+    run_depth_anything       — Stage-0 depth cache factory
+    labels_from_inverse_depth — full per-image label pipeline
+
+  REVISIT (persistence — cross-traversal supervision)
+    PersistenceChannel   — the AuxChannel
+    mine_pairs, download_images — Mapillary pair-pool factory
+
+  GASP-Real (scalereal — natural scale from metric depth)
+    ScaleRealChannel     — the AuxChannel
+    ScaleRealConfig      — every threshold in one dataclass
+    mine_pool            — offline pair miner
+
   High-level pipeline
     SSLFinetunePipeline, PipelineConfig, auto_train
 
@@ -76,6 +95,23 @@ _LAZY_EXPORTS = {
     "run_leakage_check": "eval.leakage_check",
     # ── fine-tuning ───────────────────────────────────────────────────
     "FinetuneDetectionTrainer": "finetune",
+    # ── anchored joint training (nature's labels carrier) ─────────────
+    "AnchoredJointTrainer": "anchored",
+    "AuxChannel": "anchored",
+    "save_checkpoint": "anchored",
+    "load_for_finetune": "anchored",
+    # ── TERRA (geoteach) ──────────────────────────────────────────────
+    "TerraChannel": "geoteach",
+    "run_depth_anything": "geoteach",
+    "labels_from_inverse_depth": "geoteach",
+    # ── REVISIT (persistence) ─────────────────────────────────────────
+    "PersistenceChannel": "persistence",
+    "mine_pairs": "persistence",
+    "download_images": "persistence",
+    # ── GASP-Real (scalereal) ─────────────────────────────────────────
+    "ScaleRealChannel": "scalereal",
+    "ScaleRealConfig": "scalereal",
+    "mine_pool": "scalereal",
     # ── high-level pipeline ───────────────────────────────────────────
     "SSLFinetunePipeline": "pipeline",
     "PipelineConfig": "pipeline",
