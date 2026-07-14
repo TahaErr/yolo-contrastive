@@ -169,6 +169,18 @@ class TestRoadReconstructor:
         assert torch.equal(r._corrupt(imgs), imgs)
         r.cleanup()
 
+    def test_pathlist_dataset(self, dummy_images):
+        from pathlib import Path
+        from yolo_contrastive.roadrecon.reconstructor import _PathListDataset
+        paths = [str(p) for p in Path(dummy_images).glob("*")][:3]
+        ds = _PathListDataset(paths, imgsz=64)
+        assert len(ds) == 3
+        x = ds[0]
+        assert x.shape == (3, 64, 64)
+        assert 0.0 <= float(x.min()) and float(x.max()) <= 1.0
+        with pytest.raises(ValueError):
+            _PathListDataset([], imgsz=64)
+
     def test_save_load_full_roundtrip(self, tmp_path):
         from yolo_contrastive.roadrecon import load_reconstructor
         r = RoadReconstructor(model="yolov8n.yaml", imgsz=64, device="cpu", n_mask_patches=1)

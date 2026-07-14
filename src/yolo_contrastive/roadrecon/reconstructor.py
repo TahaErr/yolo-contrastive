@@ -24,9 +24,37 @@ import time
 from typing import Any, Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from .recon_net import RoadReconNet
+
+
+class _PathListDataset(Dataset):
+    """Load RGB images from an explicit list of paths (for --limit trial subsets).
+
+    Mirrors ``pretrain.dataset.UnlabeledImageDataset``'s loading (cv2, resize to a
+    square ``imgsz``, RGB float in [0, 1]) but over a caller-supplied path list, so B2
+    training and mining can share the exact same seeded subset. cv2 is lazy (E2).
+    """
+
+    def __init__(self, paths, imgsz: int) -> None:
+        self.paths = [str(p) for p in paths]
+        self.imgsz = int(imgsz)
+        if not self.paths:
+            raise ValueError("_PathListDataset got an empty path list")
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        import cv2  # lazy
+        import numpy as np
+        img = cv2.imread(self.paths[idx])
+        if img is None:
+            return torch.zeros(3, self.imgsz, self.imgsz)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+        return torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
 
 
 class RoadReconstructor:
@@ -171,7 +199,7 @@ class RoadReconstructor:
 
     def train(
         self,
-        images_dir: str,
+        images_dir: Optional[str] = None,
         epochs: int = 100,
         batch_size: int = 32,
         lr: float = 1e-3,
@@ -181,18 +209,29 @@ class RoadReconstructor:
         output: str = "roadrecon_backbone.pt",
         save_every: int = 25,
         print_every: int = 10,
+        image_list: Optional[list] = None,
     ) -> str:
         """Run road-reconstruction pretraining; save the best-epoch encoder.
+
+        Args:
+            images_dir: pool image directory (recursively globbed). Ignored if
+                ``image_list`` is given.
+            image_list: explicit list of image paths (e.g. a seeded --limit subset for
+                trial runs). Takes precedence over ``images_dir``.
 
         Returns:
             Path to the saved backbone checkpoint (the **M2** init).
         """
         import copy as _copy
 
-        # lazy (both pull cv2 via pretrain/__init__ → keeps roadrecon import light)
-        from ..pretrain.dataset import UnlabeledImageDataset
-        from ..pretrain.backbone_utils import save_backbone
-        dataset = UnlabeledImageDataset(images_dir, imgsz=self.imgsz)
+        from ..pretrain.backbone_utils import save_backbone  # lazy (pulls cv2 via pretrain/__init__)
+        if image_list is not None:
+            dataset = _PathListDataset(image_list, self.imgsz)
+        elif images_dir is not None:
+            from ..pretrain.dataset import UnlabeledImageDataset  # lazy
+            dataset = UnlabeledImageDataset(images_dir, imgsz=self.imgsz)
+        else:
+            raise ValueError("train() needs either images_dir or image_list")
         dataloader = DataLoader(
             dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
             pin_memory=(self.device.type == "cuda"), drop_last=True,

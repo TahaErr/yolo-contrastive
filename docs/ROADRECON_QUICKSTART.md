@@ -39,7 +39,18 @@ boxes) is the kill-gate set; the fold dir is the LOSO input.
 ## 1. Stage 1 — train the B2 reconstructor + mine (`examples/12`)
 
 `examples/12_roadrecon_pretrain.py` trains B2 (saves the **M2** backbone and a full-net
-checkpoint) and mines the anomaly boxes (the **M3** replay dataset) in one run:
+checkpoint) and mines the anomaly boxes (the **M3** replay dataset) in one run.
+
+**Trial first (recommended): `--limit 30000`** runs B2 training AND mining on the same
+seeded 30K subset — a fast dry run before committing to the full pool:
+
+```bash
+python examples/12_roadrecon_pretrain.py \
+    --pool /content/pool_images --out runs/roadrecon_trial \
+    --limit 30000 --imgsz 384 --epochs 10 --batch 64 --device 0 --z-thresh 3.0
+```
+
+Then the full pool (drop `--limit`, longer/larger):
 
 ```bash
 python examples/12_roadrecon_pretrain.py \
@@ -47,10 +58,9 @@ python examples/12_roadrecon_pretrain.py \
     --imgsz 512 --epochs 30 --batch 64 --tap-level P3 --device 0 --z-thresh 3.0
 ```
 
-Outputs: `runs/roadrecon/roadrecon_backbone.pt` (M2), `runs/roadrecon/roadrecon_full.pt`
-(mining-ready), `runs/roadrecon/mined/data.yaml` (M3 dataset). Watch the recon loss fall.
-*(A100 rough budget: ~30 epochs on ~181K @ 512px ≈ several GPU-hours. Start smaller —
-`--epochs 10 --imgsz 384` — to reach the kill-gate fast.)*
+Outputs (per `--out`): `roadrecon_backbone.pt` (M2), `roadrecon_full.pt` (mining-ready),
+`mined/data.yaml` (M3 dataset). Watch the recon loss fall. *(A100 rough budget: the 30K
+trial @ 384px is well under an hour; ~30 epochs on ~181K @ 512px ≈ several GPU-hours.)*
 
 ---
 
@@ -132,10 +142,10 @@ across seeds. `roadrecon_m3` must clear `scratch` decisively and reach/pass `coc
 ## 5. Order of operations (fail fast)
 
 1. **Extract pool + verify count** (§0).
-2. **Short B2 pretrain** (`--epochs 10 --imgsz 384`, §1) → `roadrecon_full.pt`.
+2. **30K TRIAL B2 pretrain** (`--limit 30000 --epochs 10 --imgsz 384`, §1) → `roadrecon_full.pt`.
 3. **KILL-GATE** (§2) on a labeled fold, sweeping `--min-box-area`. **KILL here if impure /
    small-tail missing** — before any long GPU run.
-4. If GO: **full B2 pretrain** (§1) → **M3 anchored** (§3, +replay-only control) →
-   **LOSO eval** (§4).
+4. If GO: **full-pool B2 pretrain** (§1, drop `--limit`) → **M3 anchored** (§3, +replay-only
+   control) → **LOSO eval** (§4).
 5. Later phases: **B1** (own depth net from A2D2 LiDAR + Cityscapes stereo — needs net-new
    sensor-GT ingestion) → **M1** geometry → **M4** geometry∧appearance consensus.

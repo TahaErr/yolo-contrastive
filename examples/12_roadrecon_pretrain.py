@@ -68,6 +68,10 @@ def main() -> None:
     ap.add_argument("--device", default=0)
     ap.add_argument("--z-thresh", type=float, default=3.0, help="mining robust-z anomaly threshold")
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--limit", type=int, default=0,
+                    help="0 = full pool; N = seeded random subset of N images for a TRIAL run "
+                         "(B2 training AND mining share the same subset)")
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-train", action="store_true",
                     help="reuse an existing roadrecon_full.pt and only re-mine")
     args = ap.parse_args()
@@ -84,6 +88,17 @@ def main() -> None:
         AnomalyMineConfig, RoadReconstructor, load_reconstructor, mine_anomaly_labels,
     )
 
+    # ── select the pool (full, or a seeded --limit trial subset shared by both stages) ──
+    images = _pool_images(pool)
+    if not images:
+        raise SystemExit(f"no images under {pool}")
+    if args.limit and args.limit < len(images):
+        import numpy as np
+        idx = sorted(np.random.default_rng(args.seed)
+                     .choice(len(images), size=args.limit, replace=False).tolist())
+        images = [images[i] for i in idx]
+        print(f"[12] --limit {args.limit}: TRIAL subset of {len(images)} images (seed {args.seed})")
+
     # ── Stage 1: train B2 (or reload) ────────────────────────────────────────
     if args.skip_train:
         if not full_ckpt.exists():
@@ -93,7 +108,7 @@ def main() -> None:
     else:
         rec = RoadReconstructor(model="yolov8n.yaml", imgsz=args.imgsz,
                                 tap_level=args.tap_level, device=args.device)
-        rec.train(str(pool), epochs=args.epochs, batch_size=args.batch,
+        rec.train(image_list=[p for _, p in images], epochs=args.epochs, batch_size=args.batch,
                   num_workers=args.num_workers, output=str(backbone_ckpt))
         rec.save(str(full_ckpt))
         print(f"[12] M2 backbone: {backbone_ckpt}\n[12] full net:    {full_ckpt}")
@@ -101,7 +116,7 @@ def main() -> None:
     # ── Stage 2: mine anomaly labels → YOLO dataset (M3 replay data) ──────────
     mined_root = out / "mined"
     stats = mine_anomaly_labels(
-        rec, _pool_images(pool), str(mined_root),
+        rec, images, str(mined_root),
         cfg=AnomalyMineConfig(z_thresh=args.z_thresh), imgsz=args.imgsz,
     )
     rec.cleanup()
