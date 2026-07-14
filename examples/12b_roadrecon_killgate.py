@@ -59,11 +59,23 @@ def _resolve_images(dataset: str) -> list:
     import os
     import yaml as _yaml
     p = Path(dataset)
+    if not p.exists():
+        raise SystemExit(
+            f"--dataset not found: {dataset}\n"
+            "Point it at a LABELED pothole set present ON THIS MACHINE: a dir with images/+labels/, "
+            "a YOLO data.yaml, or a .txt image list. NOTE: a Pothole-5000 fold data.yaml/val.txt "
+            "built on another machine holds ABSOLUTE paths that won't resolve here — rebuild the folds "
+            "locally (prepare_downstream + build_cv_splits) or point --dataset at a local images/+labels/ dir.")
     if p.suffix.lower() in {".yaml", ".yml"}:
         cfg = _yaml.safe_load(p.read_text(encoding="utf-8")) or {}
         base = Path(cfg.get("path", p.parent))
         val = str(cfg.get("val", "images"))
         ref = Path(val) if os.path.isabs(val) else (base / val)
+        if not ref.exists():
+            raise SystemExit(
+                f"data.yaml's val points to a missing path: {ref}\n"
+                "The fold's train/val lists likely hold absolute paths from another machine. "
+                "Rebuild the folds here, or point --dataset at a local images/+labels/ dir.")
         if ref.suffix.lower() == ".txt":
             return [Path(x) for x in ref.read_text(encoding="utf-8").split() if x.strip()]
         return sorted(x for x in ref.rglob("*") if x.suffix.lower() in _IMG_EXTS)
