@@ -112,6 +112,13 @@ _LAZY_EXPORTS = {
     "ScaleRealChannel": "scalereal",
     "ScaleRealConfig": "scalereal",
     "mine_pool": "scalereal",
+    # ── roadrecon (pure reconstruction-based pretraining: B2/M2/M3) ────
+    "RoadReconNet": "roadrecon",
+    "RoadReconstructor": "roadrecon",
+    "RoadReconChannel": "roadrecon",
+    "AnomalyMineConfig": "roadrecon",
+    "mine_anomaly_labels": "roadrecon",
+    "full_transplant_detection_runner": "roadrecon",
     # ── high-level pipeline ───────────────────────────────────────────
     "SSLFinetunePipeline": "pipeline",
     "PipelineConfig": "pipeline",
